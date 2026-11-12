@@ -1,0 +1,19 @@
+{
+  "name": "niovill-desk",
+  "description": "고시원 · 원룸텔 관리 프로그램 (입실자 · 월세 장부 · 자동 문자)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node test/ledger.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.136.1"
+  },
+  "cloudflare": {
+    "bindings": {
+      "DB": { "description": "입실자 · 장부 · 문자 기록을 저장하는 데이터베이스입니다. 이름은 그대로 두셔도 됩니다." }
+    }
+  }
+}
