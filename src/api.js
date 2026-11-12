@@ -4,14 +4,26 @@ import { getSetting, setSetting, audit } from './db.js';
 import { kstToday, parseYmd, cycleOnOrBefore, dueDate, addDays } from './dates.js';
 import { ensureCharges, ensureAll, reallocate, chargesOf, creditOf, statusOf } from './ledger.js';
 import { smsSettings, planSms, runSms, KINDS, DEFAULT_TEMPLATES, render, bytes, typeOf, PRICE, mdw } from './sms.js';
+import { sendOne, balance, solapiReady } from './sender.js';
+import { importPreview, importRun, enqueue, processQueue, createOutDb, enqueueAll, notionReady, dbIdOf } from './notion.js';
+import { backupJson, restoreJson, exportCsv } from './data.js';
+
+// 바뀐 입실자·호실을 노션 동기화 대기열에
+async function touch(db, tenantId, roomId) {
+  if (tenantId) {
+    const t = await db.prepare('SELECT room_id, status FROM tenants WHERE id = ?').bind(tenantId).first();
+    if (t) { await enqueue(db, 'room', t.room_id); if (t.status === 'out' || t.status === 'cancelled') await enqueue(db, 'out', tenantId); }
+  }
+  if (roomId) await enqueue(db, 'room', roomId);
+}
 
 const json = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }, headers) });
 const fail = (error, status = 400) => json({ ok: false, error }, status);
 const str = (v, max) => String(v == null ? '' : v).trim().slice(0, max);
-async function readBody(request) {
+async function readBody(request, max = 100000) {
   if (!(request.headers.get('Content-Type') || '').includes('application/json')) throw new Error('type');
   const t = await request.text();
-  if (t.length > 100000) throw new Error('size');
+  if (t.length > max) throw new Error('size');
   const b = JSON.parse(t || '{}');
   if (!b || typeof b !== 'object') throw new Error('body');
   return b;
@@ -184,6 +196,10 @@ async function dash(env) {
   const cfg = await smsSettings(env.DB);
   const att = await env.DB.prepare("SELECT COUNT(*) AS n FROM sms_log WHERE status = 'unknown' OR (status = 'failed' AND tries >= 2)").first();
   if (att && att.n) todo.push({ kind: 'sms', text: '문자 ' + att.n + '건 결과 확인 필요 (실패·응답 없음)' });
+  const nq = await env.DB.prepare('SELECT COUNT(*) AS n FROM notion_queue WHERE done_at IS NULL AND tries >= 3').first();
+  if (nq && nq.n) todo.push({ kind: 'notion', text: '노션 동기화 ' + nq.n + '건 계속 실패 → 설정에서 확인' });
+  const bal = await balanceCached(env);
+  if (bal && bal.balance + bal.point < 2000) todo.push({ kind: 'sms', text: '솔라피 잔액 ' + (bal.balance + bal.point) + '원 · 충전 필요' });
   const lastRun = await env.DB.prepare('SELECT day, at, mode, planned, sent, failed FROM runs ORDER BY id DESC LIMIT 1').first();
   return json({
     ok: true, today, sms: { mode: cfg.stop ? 'stopped' : cfg.testMode ? 'test' : 'live', noAccount: !String(cfg.account || '').trim(), lastRun },
@@ -235,7 +251,8 @@ function tenantFields(b) {
     master: str(b.master, 20),
     cash_receipt: b.cash_receipt ? 1 : 0,
     memo: str(b.memo, 300),
-    sms_off: b.sms_off ? 1 : 0
+    sms_off: b.sms_off ? 1 : 0,
+    notion_off: b.notion_off ? 1 : 0
   };
 }
 async function addPayment(db, admin, t, amount, paidOn, method, memo) {
@@ -254,8 +271,8 @@ async function tenantCreate(env, admin, b) {
   if (living && moveIn > today) bad('이미 입실한 분이면 입실일이 오늘 이전이어야 합니다');
   const from = living ? Math.max(0, cycleOnOrBefore(moveIn, today)) : 0;
   const r = await db
-    .prepare('INSERT INTO tenants (room_id, name, phone, move_in, rent, deposit, gender, master, cash_receipt, memo, sms_off, status, ledger_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(room.id, f.name, f.phone, moveIn, rent, f.deposit, f.gender, f.master, f.cash_receipt, f.memo, f.sms_off, living ? 'in' : 'reserved', from)
+    .prepare('INSERT INTO tenants (room_id, name, phone, move_in, rent, deposit, gender, master, cash_receipt, memo, sms_off, notion_off, status, ledger_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(room.id, f.name, f.phone, moveIn, rent, f.deposit, f.gender, f.master, f.cash_receipt, f.memo, f.sms_off, f.notion_off, living ? 'in' : 'reserved', from)
     .run();
   const id = r.meta.last_row_id;
   const t = await tenantRow(db, id);
@@ -267,6 +284,7 @@ async function tenantCreate(env, admin, b) {
       await audit(db, admin, '입금', manText(rent) + ' · 등록 시 이번 회차 입금됨', { tenant: id });
     }
   }
+  await touch(db, id);
   return json({ ok: true, id });
 }
 async function tenantUpdate(env, admin, b) {
@@ -287,8 +305,8 @@ async function tenantUpdate(env, admin, b) {
     changes.push('입실일 ' + t.move_in + ' → ' + moveIn);
   }
   await db
-    .prepare("UPDATE tenants SET room_id = ?, name = ?, phone = ?, move_in = ?, deposit = ?, gender = ?, master = ?, cash_receipt = ?, memo = ?, sms_off = ?, updated_at = datetime('now') WHERE id = ?")
-    .bind(roomId, f.name, f.phone, moveIn, f.deposit, f.gender, f.master, f.cash_receipt, f.memo, f.sms_off, t.id)
+    .prepare("UPDATE tenants SET room_id = ?, name = ?, phone = ?, move_in = ?, deposit = ?, gender = ?, master = ?, cash_receipt = ?, memo = ?, sms_off = ?, notion_off = ?, updated_at = datetime('now') WHERE id = ?")
+    .bind(roomId, f.name, f.phone, moveIn, f.deposit, f.gender, f.master, f.cash_receipt, f.memo, f.sms_off, f.notion_off, t.id)
     .run();
   if (moveIn !== t.move_in && t.status !== 'reserved') {
     // 납부일이 바뀌므로 장부를 다시 만듦 (입금 기록이 없을 때만 여기 옴)
@@ -299,6 +317,7 @@ async function tenantUpdate(env, admin, b) {
     await reallocate(db, t.id);
   }
   if (changes.length) await audit(db, admin, '정보 수정', changes.join(', '), { tenant: t.id, room: roomId });
+  await touch(db, t.id, roomId !== t.room_id ? t.room_id : null);
   return json({ ok: true });
 }
 async function rentChange(env, admin, b) {
@@ -317,6 +336,7 @@ async function rentChange(env, admin, b) {
     await reallocate(db, t.id);
   }
   await audit(db, admin, '월세 변경', manText(t.rent) + ' → ' + manText(rent) + ' (' + eff + '부터' + (applied ? ', 만들어진 미납분 ' + applied + '건에도 적용' : '') + ')', { tenant: t.id });
+  await touch(db, t.id);
   return json({ ok: true });
 }
 async function checkin(env, admin, b) {
@@ -335,6 +355,7 @@ async function checkin(env, admin, b) {
     await addPayment(db, admin, nt, amt, moveIn, str(b.method, 10) || '계좌', '입실일 첫 달');
     await audit(db, admin, '입금', manText(amt) + ' · 입실일 첫 달', { tenant: t.id });
   }
+  await touch(db, t.id);
   return json({ ok: true });
 }
 async function cancelReserve(env, admin, b) {
@@ -343,6 +364,7 @@ async function cancelReserve(env, admin, b) {
   if (t.status !== 'reserved') bad('입실예정인 분만 취소할 수 있습니다');
   await db.prepare("UPDATE tenants SET status = 'cancelled', out_date = ?, memo = TRIM(COALESCE(memo, '') || ' [입실 취소] ' || ?), updated_at = datetime('now') WHERE id = ?").bind(await todayOf(env), str(b.reason, 100), t.id).run();
   await audit(db, admin, '입실 취소', str(b.reason, 100), { tenant: t.id, room: t.room_id });
+  await touch(db, t.id);
   return json({ ok: true });
 }
 async function leaving(env, admin, b) {
@@ -356,6 +378,7 @@ async function leaving(env, admin, b) {
     await ensureCharges(db, await tenantRow(db, t.id), today);
     await reallocate(db, t.id);
     await audit(db, admin, '퇴실예정 취소 (계속 거주)', '', { tenant: t.id });
+    await touch(db, t.id);
     return json({ ok: true });
   }
   if (t.status !== 'in' && t.status !== 'leaving') bad('입실 중인 분만 퇴실예정으로 바꿀 수 있습니다');
@@ -367,6 +390,7 @@ async function leaving(env, admin, b) {
     await reallocate(db, t.id);
   }
   await audit(db, admin, '퇴실예정', leaveDate ? '퇴실예정일 ' + leaveDate : '날짜 미정', { tenant: t.id });
+  await touch(db, t.id);
   return json({ ok: true });
 }
 async function checkoutPreview(env, id, outDate) {
@@ -403,6 +427,7 @@ async function checkout(env, admin, b) {
   const ch = ((await chargesOf(db, [t.id]))[t.id] || []).filter((c) => !c.void);
   const owed = ch.reduce((a, c) => a + c.amount - c.paid, 0);
   await audit(db, admin, '퇴실 처리', '퇴실일 ' + outDate + ' · 보증금 ' + manText(t.deposit) + ' 중 반환 ' + manText(refund) + (deduct ? ' · 공제 ' + manText(deduct) + ' (' + note + ')' : '') + (fromDeposit ? ' · 그중 ' + manText(fromDeposit) + ' 미납 월세 충당' : '') + (owed ? ' · 남은 미납 ' + manText(owed) : ''), { tenant: t.id, room: t.room_id });
+  await touch(db, t.id);
   return json({ ok: true, owed });
 }
 
@@ -417,6 +442,7 @@ async function pay(env, admin, b) {
   const method = ['계좌', '현금', '카드', '기타'].includes(b.method) ? b.method : '계좌'; // '보증금 공제'는 퇴실 처리에서만
   await addPayment(db, admin, t, amount, paidOn, method, str(b.memo, 100));
   await audit(db, admin, '입금', manText(amount) + ' · ' + paidOn + ' · ' + method + (b.memo ? ' · ' + str(b.memo, 100) : ''), { tenant: t.id });
+  await touch(db, t.id);
   return json({ ok: true });
 }
 async function payCancel(env, admin, b) {
@@ -429,6 +455,7 @@ async function payCancel(env, admin, b) {
   await db.prepare("UPDATE payments SET cancelled_at = datetime('now'), cancelled_by = ?, cancel_reason = ? WHERE id = ?").bind(admin.name, reason, p.id).run();
   await reallocate(db, p.tenant_id);
   await audit(db, admin, '입금 취소', manText(p.amount) + ' (' + p.paid_on + ') · ' + reason, { tenant: p.tenant_id });
+  await touch(db, p.tenant_id);
   return json({ ok: true });
 }
 
@@ -480,11 +507,13 @@ async function roomSave(env, admin, b) {
     if (dup) bad(no + '호가 이미 있습니다');
     await db.prepare('UPDATE rooms SET no = ?, type = ?, kind = ?, repair = ?, sort = ?, memo = ? WHERE id = ?').bind(no, type, kind, repair, sort, str(b.memo, 100), r.id).run();
     await audit(db, admin, '호실 수정', no + '호', { room: r.id });
+    await touch(db, null, r.id);
   } else {
     const dup = await db.prepare('SELECT 1 AS x FROM rooms WHERE no = ?').bind(no).first();
     if (dup) bad(no + '호가 이미 있습니다');
     const r = await db.prepare('INSERT INTO rooms (no, type, kind, repair, sort, memo) VALUES (?, ?, ?, ?, ?, ?)').bind(no, type, kind, repair, sort, str(b.memo, 100)).run();
     await audit(db, admin, '호실 추가', no + '호', { room: r.meta.last_row_id });
+    await touch(db, null, r.meta.last_row_id);
   }
   return json({ ok: true });
 }
@@ -518,7 +547,7 @@ async function smsStatus(env) {
   return json({
     ok: true, today,
     mode: cfg.stop ? 'stopped' : cfg.testMode ? 'test' : 'live',
-    cfg: { senderPhone: cfg.senderPhone, account: cfg.account, opPhones: cfg.opPhones, windowStart: cfg.windowStart, windowEnd: cfg.windowEnd, solapi: !!(env.SOLAPI_KEY && env.SOLAPI_SECRET) || env.SMS_MOCK === '1' },
+    cfg: { senderPhone: cfg.senderPhone, testPhone: cfg.testPhone, account: cfg.account, opPhones: cfg.opPhones, windowStart: cfg.windowStart, windowEnd: cfg.windowEnd, solapi: solapiReady(env) || env.SMS_MOCK === '1' }, balance: await balanceCached(env),
     plan: items.map((i) => ({ room: i.room, name: i.name, kind: i.kind, kindName: KINDS[i.kind].name, to: i.to, due: i.due, text: i.text, type: i.type, blocked: i.blocked, retry: !!i.retryOf, tenant_id: i.tenant_id })),
     estimate: items.filter((i) => !i.blocked).reduce((a, i) => a + PRICE[i.type], 0),
     month: { count: m.n, cost: m.cost }, attention, log: log || [], runs: runs || []
@@ -526,7 +555,7 @@ async function smsStatus(env) {
 }
 async function smsSettingsGet(env) {
   const cfg = await smsSettings(env.DB);
-  return json({ ok: true, cfg, kinds: KINDS, defaults: DEFAULT_TEMPLATES, solapi: !!(env.SOLAPI_KEY && env.SOLAPI_SECRET) || env.SMS_MOCK === '1' });
+  return json({ ok: true, cfg, kinds: KINDS, defaults: DEFAULT_TEMPLATES, solapi: solapiReady(env) || env.SMS_MOCK === '1' });
 }
 async function smsSettingsSave(env, admin, b) {
   const db = env.DB;
@@ -551,7 +580,7 @@ async function smsSettingsSave(env, admin, b) {
   const changes = [];
   if (b.testMode != null && !!b.testMode !== cur.testMode) {
     if (!b.testMode) {
-      if (!(env.SOLAPI_KEY && env.SOLAPI_SECRET) && env.SMS_MOCK !== '1') bad('솔라피 키가 아직 없어 실제 발송으로 바꿀 수 없습니다');
+      if (!solapiReady(env) && env.SMS_MOCK !== '1') bad('솔라피 키가 아직 없어 실제 발송으로 바꿀 수 없습니다');
       if (!next.senderPhone) bad('발신번호를 먼저 입력해 주세요');
     }
     next.testMode = !!b.testMode;
@@ -596,8 +625,144 @@ async function smsPreview(env, b) {
   return json({ ok: true, text, bytes: bytes(text), type: typeOf(text) });
 }
 
+/* ── 시험 발송 · 잔액 ── */
+async function smsTest(env, admin, b) {
+  const db = env.DB;
+  const cfg = await smsSettings(db);
+  if (!cfg.testPhone) bad('설정에 "시험 발송 받을 번호"를 먼저 넣어 주세요');
+  const text = str(b.text, 1000) || '[' + ((await getSetting(db, 'bizName', '')) || '관리') + '] 시험 문자입니다. 이 문자가 보이면 문자 연결이 정상입니다.';
+  const slot = 'test-' + Date.now();
+  const ins = await db.prepare("INSERT INTO sms_log (tenant_id, charge_id, kind, slot, to_phone, text, status, tries, by_name) VALUES (0, 0, 'test', ?, ?, ?, 'sending', 1, ?)").bind(slot, cfg.testPhone, text, admin.name).run();
+  const r = await sendOne(env, cfg, cfg.testPhone, text);
+  await db.prepare("UPDATE sms_log SET status = ?, msg_type = ?, cost = ?, msg_id = ?, group_id = ?, err = ?, updated_at = datetime('now') WHERE id = ?")
+    .bind(r.ok ? 'sent' : r.unknown ? 'unknown' : 'failed', r.type || typeOf(text), r.ok ? PRICE[r.type || typeOf(text)] : null, r.msgId || null, r.groupId || null, r.ok ? null : String(r.error || '').slice(0, 200), ins.meta.last_row_id).run();
+  await audit(db, admin, '시험 문자', cfg.testPhone + ' · ' + (r.ok ? '접수됨' : r.error));
+  return r.ok ? json({ ok: true, to: cfg.testPhone }) : fail('보내지 못했습니다: ' + r.error);
+}
+async function balanceCached(env) {
+  if (!solapiReady(env) && env.SMS_MOCK !== '1') return null;
+  const c = await getSetting(env.DB, 'balanceCache', null);
+  if (c && Date.now() - c.t < 10 * 60 * 1000) return c.v;
+  const v = await balance(env);
+  await setSetting(env.DB, 'balanceCache', { t: Date.now(), v });
+  return v;
+}
+
+/* ── 공지 · 개별 문자 ── */
+const NOTICE_DEFAULTS = [
+  { name: '방역 안내', text: '[{상호}] 안녕하세요. {날짜}에 건물 전체 방역을 진행합니다. 작업 시간에는 방문을 열어 두시거나 귀중품을 정리해 주세요. 협조 감사합니다.' },
+  { name: '시설 보수', text: '[{상호}] 안녕하세요. {날짜}에 시설 보수 작업이 있습니다. 작업 중 소음이 있을 수 있어 양해 부탁드립니다.' },
+  { name: '에어컨 청소', text: '[{상호}] {이름}님, {날짜}에 {호실}호 에어컨 청소를 진행합니다. 방문 시간은 따로 연락드리겠습니다.' }
+];
+async function noticeTargets(db, b) {
+  if (b.scope === 'tenant') {
+    const { results } = await db.prepare("SELECT t.*, r.no AS room FROM tenants t JOIN rooms r ON r.id = t.room_id WHERE t.id = ? AND t.status IN ('reserved', 'in', 'leaving')").bind(Number(b.tenant_id)).all();
+    return (results || []).filter((t) => t.phone);
+  }
+  const st = ["'in'"];
+  if (b.includeLeaving) st.push("'leaving'");
+  if (b.includeReserved) st.push("'reserved'");
+  let q = 'SELECT t.*, r.no AS room FROM tenants t JOIN rooms r ON r.id = t.room_id WHERE t.status IN (' + st.join(',') + ')';
+  const args = [];
+  if (b.scope === 'rooms') {
+    const ids = (Array.isArray(b.rooms) ? b.rooms : []).map(Number).filter(Boolean).slice(0, 100);
+    if (!ids.length) bad('호실을 하나 이상 골라 주세요');
+    q += ' AND r.id IN (' + ids.map(() => '?').join(',') + ')';
+    args.push(...ids);
+  }
+  const { results } = await db.prepare(q + ' ORDER BY r.sort, r.no').bind(...args).all();
+  return (results || []).filter((t) => t.phone);
+}
+async function noticeBuild(env, b) {
+  const db = env.DB;
+  const text = str(b.text, 1000);
+  if (!text) bad('보낼 내용을 입력해 주세요');
+  const date = b.date && parseYmd(b.date) ? mdw(b.date) : '';
+  if (/\{날짜\}/.test(text) && !date) bad('내용에 {날짜}가 있어 날짜를 골라 주세요');
+  const biz = (await getSetting(db, 'bizName', '')) || '';
+  const ts = await noticeTargets(db, b);
+  const items = ts.map((t) => {
+    const msg = render(text, { 상호: biz, 호실: t.room, 이름: t.name, 날짜: date, 월세: manText(t.rent), 보증금: manText(t.deposit), 입실일: mdw(t.move_in) });
+    return { tenant_id: t.id, room: t.room, name: t.name, to: t.phone, text: msg, type: typeOf(msg) };
+  });
+  return { items, cost: items.reduce((a, i) => a + PRICE[i.type], 0) };
+}
+async function noticePreview(env, b) {
+  const { items, cost } = await noticeBuild(env, b);
+  return json({ ok: true, count: items.length, cost, targets: items.map((i) => i.room + '호 ' + i.name), sample: items[0] ? items[0].text : '', type: items[0] ? items[0].type : '' });
+}
+async function noticeSend(env, admin, b) {
+  const db = env.DB;
+  const { items } = await noticeBuild(env, b);
+  if (!items.length) bad('보낼 대상이 없습니다');
+  if (Number(b.expect) !== items.length) bad('대상 인원이 바뀌었습니다. 미리보기를 다시 해 주세요');
+  if (items.length > 35) bad('한 번에 35명까지 보낼 수 있습니다. 나눠서 보내 주세요');
+  const cfg = await smsSettings(db);
+  const today = await todayOf(env);
+  const run = await db.prepare("INSERT INTO runs (day, trigger, mode, planned, note) VALUES (?, 'notice', 'notice', ?, ?)").bind(today, items.length, str(b.text, 60)).run();
+  const runId = run.meta.last_row_id;
+  let sent = 0;
+  const failed = [];
+  for (const it of items) {
+    const ins = await db.prepare("INSERT OR IGNORE INTO sms_log (tenant_id, charge_id, kind, slot, to_phone, text, status, tries, run_id, by_name) VALUES (?, ?, 'notice', 'T', ?, ?, 'sending', 1, ?, ?)").bind(it.tenant_id, runId, it.to, it.text, runId, admin.name).run();
+    if (!ins.meta || ins.meta.changes !== 1) continue;
+    const r = await sendOne(env, cfg, it.to, it.text);
+    await db.prepare("UPDATE sms_log SET status = ?, msg_type = ?, cost = ?, msg_id = ?, group_id = ?, err = ?, updated_at = datetime('now') WHERE id = ?")
+      .bind(r.ok ? 'sent' : r.unknown ? 'unknown' : 'failed', r.type || it.type, r.ok ? PRICE[r.type || it.type] : null, r.msgId || null, r.groupId || null, r.ok ? null : String(r.error || '').slice(0, 200), ins.meta.last_row_id).run();
+    if (r.ok) sent++; else failed.push(it.room + '호 ' + it.name + ' (' + r.error + ')');
+    await touch(db, it.tenant_id);
+  }
+  await db.prepare('UPDATE runs SET sent = ?, failed = ? WHERE id = ?').bind(sent, failed.length, runId).run();
+  await audit(db, admin, b.scope === 'tenant' ? '개별 문자' : '공지 문자', items.length + '명 · 보냄 ' + sent + (failed.length ? ' · 실패 ' + failed.length : '') + ' · ' + str(b.text, 40), b.scope === 'tenant' ? { tenant: items[0].tenant_id } : {});
+  return json({ ok: true, sent, failed });
+}
+async function noticeTemplatesGet(env) {
+  return json({ ok: true, templates: await getSetting(env.DB, 'noticeTemplates', NOTICE_DEFAULTS) });
+}
+async function noticeTemplatesSave(env, admin, b) {
+  const list = (Array.isArray(b.templates) ? b.templates : []).slice(0, 30).map((t) => ({ name: str(t.name, 20), text: str(t.text, 1000) })).filter((t) => t.name && t.text);
+  await setSetting(env.DB, 'noticeTemplates', list, admin.name);
+  await audit(env.DB, admin, '공지 템플릿 저장', list.length + '개');
+  return json({ ok: true });
+}
+
+/* ── 노션 ── */
+async function notionGet(env) {
+  const db = env.DB;
+  const q = await db.prepare("SELECT COUNT(*) AS waiting, SUM(CASE WHEN tries > 0 THEN 1 ELSE 0 END) AS failing, MAX(last_err) AS err FROM notion_queue WHERE done_at IS NULL").first();
+  return json({ ok: true, token: notionReady(env), roomsDb: await getSetting(db, 'notionRoomsDb', ''), outDb: await getSetting(db, 'notionOutDb', ''), last: await getSetting(db, 'notionLast', null), queue: q,
+    imported: (await db.prepare('SELECT COUNT(*) AS n FROM tenants').first()).n > 0 });
+}
+async function notionSettings(env, admin, b) {
+  const id = dbIdOf(b.roomsDb);
+  if (!id) bad('노션 입실자 현황 데이터베이스 주소를 붙여 넣어 주세요');
+  await setSetting(env.DB, 'notionRoomsDb', id, admin.name);
+  if (b.outDb) await setSetting(env.DB, 'notionOutDb', dbIdOf(b.outDb), admin.name);
+  await audit(env.DB, admin, '노션 설정 저장', '');
+  return json({ ok: true });
+}
+async function notionAct(env, admin, path) {
+  if (!notionReady(env)) bad('노션 토큰(NOTION_TOKEN)이 설정되지 않았습니다');
+  try {
+    if (path === 'notion/preview') return json({ ok: true, rows: (await importPreview(env, await todayOf(env))).map((r) => ({ no: r.no, state: r.state, name: r.name, phone: r.phone, move_in: r.move_in, rent: r.rent, deposit: r.deposit, paid: r.paid, paidFor: r.paidFor, sms_off: r.sms_off, issues: r.issues })) });
+    if (path === 'notion/import') {
+      const r = await importRun(env, admin, await todayOf(env));
+      await audit(env.DB, admin, '노션에서 처음 가져오기', '호실 ' + r.rooms + ' · 입실자 ' + r.tenants);
+      await enqueueAll(env.DB);
+      return json({ ok: true, result: r });
+    }
+    if (path === 'notion/outdb') { const id = await createOutDb(env); await audit(env.DB, admin, '노션 퇴실 기록 DB 만들기', ''); return json({ ok: true, id }); }
+    if (path === 'notion/resync') { await enqueueAll(env.DB); return json({ ok: true, result: await processQueue(env, 10) }); }
+    if (path === 'notion/sync') return json({ ok: true, result: await processQueue(env, 10) });
+  } catch (e) {
+    if (e instanceof Bad) throw e;
+    bad('노션: ' + ((e && e.message) || e));
+  }
+  bad('없는 기능입니다');
+}
+
 /* ── 입구 ── */
-const OWNER_ONLY = new Set(['invite', 'admin/active', 'settings', 'room/save', 'room/delete', 'admins', 'sms/settings']);
+const OWNER_ONLY = new Set(['invite', 'admin/active', 'settings', 'room/save', 'room/delete', 'admins', 'sms/settings', 'notion', 'notion/settings', 'notion/preview', 'notion/import', 'notion/outdb', 'notion/resync', 'notion/sync', 'backup', 'restore', 'export']);
 export async function handleApi(request, env, path) {
   const db = env.DB;
   const url = new URL(request.url);
@@ -607,7 +772,7 @@ export async function handleApi(request, env, path) {
     if (request.method === 'GET' && path === 'me') return await me(env, request);
     if (request.method === 'POST') {
       let b;
-      try { b = await readBody(request); } catch (e) { return fail('요청 형식이 맞지 않습니다', 415); }
+      try { b = await readBody(request, path === 'restore' ? 20000000 : 100000); } catch (e) { return fail(e && e.message === 'size' ? '파일이 너무 큽니다' : '요청 형식이 맞지 않습니다', 415); }
       if (path === 'setup') return await setup(env, request, b);
       if (path === 'login') return await login(env, request, b);
       if (path === 'invite/accept') return await inviteAccept(env, request, b);
@@ -635,6 +800,18 @@ export async function handleApi(request, env, path) {
       if (path === 'sms/run') return await smsRun(env, admin);
       if (path === 'sms/resolve') return await smsResolve(env, admin, b);
       if (path === 'sms/preview') return await smsPreview(env, b);
+      if (path === 'sms/test') return await smsTest(env, admin, b);
+      if (path === 'notice/preview') return await noticePreview(env, b);
+      if (path === 'notice/send') return await noticeSend(env, admin, b);
+      if (path === 'notice/templates') return await noticeTemplatesSave(env, admin, b);
+      if (path === 'notion/settings') return await notionSettings(env, admin, b);
+      if (path.startsWith('notion/')) return await notionAct(env, admin, path);
+      if (path === 'restore') {
+        if (b.confirm !== '복구') bad('확인 칸에 "복구"라고 입력해 주세요');
+        const counts = await restoreJson(env, b.data);
+        await audit(db, admin, '백업에서 복구', Object.entries(counts).map(([k, v]) => k + ' ' + v).join(', '));
+        return json({ ok: true, counts });
+      }
       if (path === 'dev/today' && env.DEV === '1') { await setSetting(db, 'dev_today', b.date ? dateOf(b.date, '시험') : null); return json({ ok: true }); }
       return fail('없는 기능입니다', 404);
     }
@@ -654,6 +831,14 @@ export async function handleApi(request, env, path) {
       if (path === 'settings') return await settingsGet(env);
       if (path === 'sms') return await smsStatus(env);
       if (path === 'sms/settings') return await smsSettingsGet(env);
+      if (path === 'notice/templates') return await noticeTemplatesGet(env);
+      if (path === 'notion') return await notionGet(env);
+      if (path === 'backup') {
+        const data = await backupJson(env);
+        await audit(db, admin, '백업 내려받기', '');
+        return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="desk-backup-' + (await todayOf(env)) + '.json"', 'Cache-Control': 'no-store' } });
+      }
+      if (path === 'export') { await audit(db, admin, 'CSV 내보내기', q.get('what') || ''); return await exportCsv(env, q.get('what'), await todayOf(env)); }
       return fail('없는 기능입니다', 404);
     }
     return fail('없는 기능입니다', 404);

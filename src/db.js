@@ -13,7 +13,7 @@ const SCHEMA = [
   // 금액은 모두 원 단위. ledger_from = 장부를 시작한 납부 회차(0 = 입실일)
   `CREATE TABLE IF NOT EXISTS tenants (id INTEGER PRIMARY KEY AUTOINCREMENT, room_id INTEGER NOT NULL, name TEXT NOT NULL, phone TEXT NOT NULL,
     move_in TEXT NOT NULL, rent INTEGER NOT NULL, deposit INTEGER NOT NULL DEFAULT 0, gender TEXT, master TEXT, cash_receipt INTEGER NOT NULL DEFAULT 0,
-    memo TEXT, sms_off INTEGER NOT NULL DEFAULT 0,
+    memo TEXT, sms_off INTEGER NOT NULL DEFAULT 0, notion_off INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK (status IN ('reserved', 'in', 'leaving', 'out', 'cancelled')),
     ledger_from INTEGER NOT NULL DEFAULT 0, leave_date TEXT, out_date TEXT,
     dep_refund INTEGER, dep_deduct INTEGER, dep_note TEXT, dep_done_at TEXT,
@@ -39,6 +39,10 @@ const SCHEMA = [
   // 실행 기록 (매일 09:00 자동 · 관리자 수동)
   `CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, at TEXT NOT NULL DEFAULT (datetime('now')), trigger TEXT NOT NULL, mode TEXT NOT NULL,
     planned INTEGER NOT NULL DEFAULT 0, sent INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0, note TEXT, detail TEXT)`,
+  // 노션 동기화 대기열 (kind: room = 입실자 현황 한 줄, out = 퇴실 기록 한 줄)
+  `CREATE TABLE IF NOT EXISTS notion_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, ref_id INTEGER NOT NULL, tries INTEGER NOT NULL DEFAULT 0, last_err TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), done_at TEXT)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS notion_q_open ON notion_queue (kind, ref_id) WHERE done_at IS NULL`,
   // 변경 이력
   `CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL DEFAULT (datetime('now')), admin_id INTEGER, who TEXT, action TEXT NOT NULL, detail TEXT, tenant_id INTEGER, room_id INTEGER)`,
   `CREATE INDEX IF NOT EXISTS audit_tenant ON audit (tenant_id)`

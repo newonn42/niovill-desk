@@ -3,6 +3,7 @@ import { getSetting, setSetting, audit } from './db.js';
 import { diffDays, addDays, kstToday } from './dates.js';
 import { ensureAll, chargesOf } from './ledger.js';
 import { sendOne } from './sender.js';
+import { enqueue } from './notion.js';
 
 // 종류: 보내는 기간(납부일 기준 일수, 시작~끝 – 끝까지는 놓친 날 보완)
 export const KINDS = {
@@ -47,6 +48,7 @@ export function bytes(text) {
   for (const ch of text) n += ch.charCodeAt(0) > 127 ? 2 : 1;
   return n;
 }
+export const MAX_SENDS = 35;
 export const PRICE = { SMS: 18, LMS: 45 }; // 원, 부가세 별도 (솔라피 요금표)
 export function typeOf(text) { return bytes(text) > 90 ? 'LMS' : 'SMS'; }
 
@@ -131,8 +133,9 @@ export async function runSms(env, { trigger = 'manual', today = kstToday(), admi
     return { mode: 'deferred', planned: items.length };
   }
   const runId = await record('live', 0, 0, '');
-  let sent = 0, failed = 0;
+  let sent = 0, failed = 0, n = 0;
   for (const it of ready) {
+    if (++n > MAX_SENDS) break; // 남은 건 다음 실행 때 (무료 요금제 외부 요청 한도)
     // 보내기 전에 먼저 기록 (중복 방지). 실패분 재시도는 같은 줄을 다시 씀
     let id = it.retryOf;
     if (!id) {
@@ -145,9 +148,10 @@ export async function runSms(env, { trigger = 'manual', today = kstToday(), admi
       .bind(it.to, it.text, runId, id).run();
     if (!lock.meta || lock.meta.changes !== 1) continue;
     const r = await sendOne(env, cfg, it.to, it.text);
+    await enqueue(db, 'room', (await db.prepare('SELECT room_id FROM tenants WHERE id = ?').bind(it.tenant_id).first() || {}).room_id);
     if (r.ok) {
       sent++;
-      await db.prepare("UPDATE sms_log SET status = 'sent', msg_type = ?, cost = ?, msg_id = ?, group_id = ?, err = NULL, updated_at = datetime('now') WHERE id = ?").bind(r.type || it.type, r.cost != null ? r.cost : PRICE[it.type], r.msgId || null, r.groupId || null, id).run();
+      await db.prepare("UPDATE sms_log SET status = 'sent', msg_type = ?, cost = ?, msg_id = ?, group_id = ?, err = NULL, updated_at = datetime('now') WHERE id = ?").bind(r.type || it.type, PRICE[r.type || it.type] || PRICE[it.type], r.msgId || null, r.groupId || null, id).run();
     } else {
       failed++;
       // 응답이 불확실하면 다시 보내지 않음 → '결과 확인 필요'
