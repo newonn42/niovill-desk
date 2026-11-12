@@ -30,6 +30,15 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS alloc_tenant ON allocations (tenant_id)`,
   `CREATE TABLE IF NOT EXISTS rent_changes (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id INTEGER NOT NULL, eff_date TEXT NOT NULL, old_rent INTEGER NOT NULL, new_rent INTEGER NOT NULL,
     by_name TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  // 문자 기록: 같은 입실자·같은 납부분·같은 종류·같은 받는 쪽(slot)은 한 번만 (보내기 전에 먼저 기록)
+  // status: pending 대기 · sending 요청 중 · sent 성공 · failed 실패 · unknown 결과 확인 필요 · cancelled 취소
+  `CREATE TABLE IF NOT EXISTS sms_log (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id INTEGER NOT NULL DEFAULT 0, charge_id INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL, slot TEXT NOT NULL DEFAULT 'T',
+    to_phone TEXT NOT NULL, text TEXT NOT NULL, status TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0, msg_type TEXT, cost INTEGER, msg_id TEXT, group_id TEXT, err TEXT, run_id INTEGER, by_name TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE (tenant_id, charge_id, kind, slot))`,
+  `CREATE INDEX IF NOT EXISTS sms_tenant ON sms_log (tenant_id, id)`,
+  // 실행 기록 (매일 09:00 자동 · 관리자 수동)
+  `CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, at TEXT NOT NULL DEFAULT (datetime('now')), trigger TEXT NOT NULL, mode TEXT NOT NULL,
+    planned INTEGER NOT NULL DEFAULT 0, sent INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0, note TEXT, detail TEXT)`,
   // 변경 이력
   `CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL DEFAULT (datetime('now')), admin_id INTEGER, who TEXT, action TEXT NOT NULL, detail TEXT, tenant_id INTEGER, room_id INTEGER)`,
   `CREATE INDEX IF NOT EXISTS audit_tenant ON audit (tenant_id)`

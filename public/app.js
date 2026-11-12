@@ -176,7 +176,7 @@
       if (!r.ok) return;
       TODAY = r.today;
       var c = r.counts;
-      var todoIcon = { checkin: '🔑', checkout: '🚪', call: '📞' };
+      var todoIcon = { checkin: '🔑', checkout: '🚪', call: '📞', sms: '✉️' };
       frame(ME.bizName || '고시원 관리', {}, h('div', null,
         h('div', { class: 'sec' },
           h('div', { class: 'grid4' },
@@ -184,9 +184,10 @@
             h('div', { class: 'stat' }, h('span', { text: '입실' }), h('b', { text: c.live })),
             h('div', { class: 'stat' }, h('span', { text: '공실' }), h('b', { text: c.vacant })),
             h('div', { class: 'stat' + (c.late ? ' red' : '') }, h('span', { text: '미납' }), h('b', { text: c.late }))),
+          smsBanner(r.sms),
           (c.reserved || c.repair) ? h('p', { class: 'note', text: (c.reserved ? '입실예정 ' + c.reserved + '실 ' : '') + (c.repair ? '· 수리중 ' + c.repair + '실' : '') }) : null,
           h('h2', { text: '오늘 할 일' }),
-          r.todo.length ? h('ul', { class: 'list' }, r.todo.map(function (t) { return h('li', { class: 'todo', onclick: function () { location.hash = '#/t/' + t.id; } }, h('span', { class: 'ic', text: todoIcon[t.kind] }), h('span', { text: t.text })); }))
+          r.todo.length ? h('ul', { class: 'list' }, r.todo.map(function (t) { return h('li', { class: 'todo', onclick: function () { location.hash = t.id ? '#/t/' + t.id : '#/sms'; } }, h('span', { class: 'ic', text: todoIcon[t.kind] }), h('span', { text: t.text })); }))
             : h('p', { class: 'empty', text: '없습니다 👍' }),
           h('h2', { text: '미납 ' + (r.late.length ? '· 합계 ' + man(r.owed) : '') }),
           r.late.length ? h('ul', { class: 'list' }, r.late.map(function (x) { return h('li', { class: 'todo', onclick: function () { location.hash = '#/t/' + x.id; } }, h('b', { text: x.room + '호' }), h('span', { text: x.name + ' · ' + man(x.owed) }), h('span', { class: 'pill r', text: 'D+' + x.days })); }))
@@ -360,6 +361,7 @@
                 h('td', null, x ? null : h('button', { class: 'link', type: 'button', onclick: function () { payCancelSheet(p); }, text: '취소' })));
             })))] : null,
           r.rents.length ? [h('h2', { text: '월세 변경' }), h('ul', { class: 'log card' }, r.rents.map(function (x) { return h('li', null, x.eff_date + '부터 ' + man(x.old_rent) + ' → ' + man(x.new_rent), h('small', { text: ' · ' + (x.by_name || '') })); }))] : null,
+          r.sms && r.sms.length ? [h('h2', { text: '받은 자동 문자' }), h('ul', { class: 'log card' }, r.sms.map(function (x) { var st = STATUS[x.status] || [x.status, '']; return h('li', null, h('small', { text: kt(x.updated_at) + ' ' }), (KIND[x.kind] || x.kind) + ' ', h('span', { class: 'pill ' + st[1], text: st[0] })); }))] : null,
           h('h2', { text: '변경 이력' }),
           h('ul', { class: 'log card' }, r.log.length ? r.log.map(function (x) { return h('li', null, h('small', { text: kt(x.at) + ' · ' + (x.who || '') + ' ' }), h('b', { text: x.action }), x.detail ? ' · ' + x.detail : ''); }) : h('li', { text: '없음' }))
         ));
@@ -445,9 +447,63 @@
     setTimeout(function () { q.focus(); }, 50);
   }
 
-  /* ── 문자 (5단계) ── */
+  /* ── 문자 ── */
+  var MODE = { test: ['🧪 테스트 모드', 'b', '보내지 않고 오늘 보낼 대상·문구만 기록합니다'], live: ['🟢 실제 발송 중', 'g', '매일 오전 9시에 자동으로 보냅니다'], stopped: ['⛔ 긴급 정지', 'r', '자동 문자를 보내지 않습니다'] };
+  function smsBanner(sm) {
+    if (!sm) return null;
+    var m = MODE[sm.mode];
+    return h('div', { class: 'card', style: 'display:flex;flex-direction:column;gap:4px;cursor:pointer', onclick: function () { location.hash = '#/sms'; } },
+      h('div', null, h('span', { class: 'pill ' + m[1], text: m[0] }), sm.lastRun ? h('span', { class: 'note', text: '  마지막 실행 ' + kt(sm.lastRun.at) + ' · 대상 ' + sm.lastRun.planned + '건' + (sm.lastRun.mode === 'live' ? ' · 보냄 ' + sm.lastRun.sent + (sm.lastRun.failed ? ' · 실패 ' + sm.lastRun.failed : '') : '') }) : h('span', { class: 'note', text: '  아직 실행 기록 없음' })),
+      sm.noAccount ? h('div', { class: 'warn', text: '입금계좌 문구가 비어 있어 D-1·미납 문자가 보류됩니다 → 설정에서 입력' }) : null);
+  }
+  var STATUS = { pending: ['대기', ''], sending: ['요청 중', 'b'], sent: ['성공', 'g'], failed: ['실패', 'r'], unknown: ['결과 확인 필요', 'a'], cancelled: ['취소', ''] };
+  var KIND = { d10: 'D-10 안내', d1: 'D-1 안내', dp1: 'D+1 미납', dp3: 'D+3 미납', op3: '운영자 미납 알림', opin: '운영자 입실 알림' };
+  var RUNMODE = { test: '테스트', live: '발송', stopped: '정지', deferred: '시간대 밖' };
   function smsView() {
-    frame('문자', {}, h('div', { class: 'sec' }, h('div', { class: 'card' }, h('b', { text: '자동 문자 · 공지 문자' }), h('p', { class: 'note', text: '다음 단계에서 추가됩니다 (테스트 모드부터).' }))));
+    frame('문자', {}, h('p', { class: 'loading', text: '불러오는 중…' }));
+    api('sms').then(function (r) {
+      if (!r.ok) return;
+      TODAY = r.today;
+      var m = MODE[r.mode];
+      var owner = ME.role === 'owner';
+      var head = h('div', { class: 'card' },
+        h('div', { class: 'row', style: 'align-items:center' }, h('span', { class: 'big', style: 'font-size:17px', text: m[0] }),
+          r.mode === 'stopped' ? h('button', { class: 'btn sm', style: 'flex:0;white-space:nowrap', type: 'button', onclick: function () { stopToggle(false); }, text: '다시 시작' })
+            : h('button', { class: 'btn sm red', style: 'flex:0;white-space:nowrap', type: 'button', onclick: function () { if (confirm('자동 문자를 모두 멈출까요?')) stopToggle(true); }, text: '⛔ 긴급 정지' })),
+        h('p', { class: 'note', text: m[2] }),
+        h('p', { class: 'note', text: '이번 달 보낸 문자 ' + r.month.count + '건 · 약 ' + r.month.cost.toLocaleString('ko-KR') + '원 (부가세 별도)' }),
+        !r.cfg.solapi ? h('p', { class: 'note', text: '솔라피 미연결 (6단계에서 연결)' }) : null,
+        !r.cfg.account ? h('div', { class: 'warn' }, '입금계좌 문구가 비어 있습니다. ', owner ? h('a', { href: '#/settings', text: '설정으로 이동' }) : '최고 관리자에게 요청해 주세요') : null,
+        r.attention ? h('div', { class: 'warn', text: '결과 확인이 필요한 문자 ' + r.attention + '건 (아래 발송 기록)' }) : null);
+      function stopToggle(stop) { api('sms/stop', { stop: stop }).then(function (x) { x.ok ? (toast(stop ? '정지했습니다' : '다시 시작했습니다'), reload()) : alert(x.error); }); }
+      var planList = r.plan.length ? h('ul', { class: 'list' }, r.plan.map(function (p) {
+        var body = h('pre', { style: 'white-space:pre-wrap;font:inherit;font-size:13px;margin:8px 0 0;background:var(--bg);padding:10px;border-radius:10px', hidden: true, text: p.text });
+        return h('li', { class: 'card', style: 'padding:12px' },
+          h('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;align-items:center' }, h('b', { text: p.room + '호 ' + p.name }), h('span', { class: 'pill ' + (p.kind.indexOf('op') === 0 ? 'b' : ''), text: p.kindName }), p.retry ? h('span', { class: 'pill a', text: '재시도' }) : null, p.blocked ? h('span', { class: 'pill r', text: '보류: ' + p.blocked }) : null),
+          h('div', { class: 'note', text: '받는 번호 ' + p.to + ' · ' + p.type + ' · ' + md(p.due) + ' 기준' }),
+          h('button', { class: 'link', type: 'button', onclick: function () { body.hidden = !body.hidden; this.textContent = body.hidden ? '문구 보기' : '문구 접기'; }, text: '문구 보기' }), body);
+      })) : h('p', { class: 'empty', text: '오늘 보낼 문자가 없습니다' });
+      var runBtn = h('button', { class: 'btn full ghost', type: 'button', onclick: function () {
+        if (r.mode === 'live' && !confirm('지금 실제로 ' + r.plan.filter(function (p) { return !p.blocked; }).length + '건을 보냅니다. 계속할까요?')) return;
+        runBtn.disabled = true;
+        api('sms/run', {}).then(function (x) { runBtn.disabled = false; if (!x.ok) return alert(x.error); var z = x.result; toast(z.skipped || (RUNMODE[z.mode] || z.mode) + ' 실행: 대상 ' + z.planned + '건' + (z.mode === 'live' ? ' · 보냄 ' + z.sent + ' · 실패 ' + z.failed : '')); reload(); });
+      }, text: r.mode === 'live' ? '지금 보내기 (원래는 매일 9시 자동)' : '지금 실행해 기록 남기기 (보내지 않음)' });
+      var logList = h('ul', { class: 'log card' }, r.log.length ? r.log.map(function (l) {
+        var st = STATUS[l.status] || [l.status, ''];
+        var need = l.status === 'unknown' || (l.status === 'failed' && l.tries >= 2);
+        return h('li', null, h('small', { text: kt(l.updated_at) + ' ' }), h('b', { text: (l.room ? l.room + '호 ' + (l.name || '') : '') + ' ' }), (KIND[l.kind] || l.kind) + ' → ' + l.to_phone + ' ', h('span', { class: 'pill ' + st[1], text: st[0] }), l.err ? h('small', { text: ' ' + l.err }) : null,
+          need ? h('div', { class: 'row', style: 'margin-top:4px' }, h('button', { class: 'btn sm ghost', type: 'button', onclick: function () { resolve(l.id, 'sent'); }, text: '실제로 감' }), h('button', { class: 'btn sm ghost', type: 'button', onclick: function () { resolve(l.id, 'resend'); }, text: '다시 보내기' }), h('button', { class: 'btn sm ghost', type: 'button', onclick: function () { resolve(l.id, 'drop'); }, text: '안 보냄' })) : null);
+      }) : h('li', { text: '아직 없습니다' }));
+      function resolve(id, result) { api('sms/resolve', { id: id, result: result }).then(function (x) { x.ok ? reload() : alert(x.error); }); }
+      var runsList = h('ul', { class: 'log card' }, r.runs.length ? r.runs.map(function (x) {
+        return h('li', null, h('small', { text: kt(x.at) + ' · ' + (x.trigger === 'cron' ? '자동' : '수동') + ' ' }), h('b', { text: RUNMODE[x.mode] || x.mode }), ' · 대상 ' + x.planned + (x.mode === 'live' ? ' · 보냄 ' + x.sent + ' · 실패 ' + x.failed : '') + (x.blocked ? ' · 보류 ' + x.blocked : ''), x.note ? h('small', { text: ' ' + x.note }) : null);
+      }) : h('li', { text: '아직 없습니다' }));
+      frame('문자', {}, h('div', { class: 'sec' }, head,
+        h('h2', { text: '오늘 보낼 문자 ' + r.plan.length + '건' }), r.plan.length ? h('p', { class: 'note', text: '예상 비용 약 ' + r.estimate + '원 (부가세 별도) · 입금 확인·퇴실예정·문자 제외로 바꾸면 바로 빠집니다' }) : null,
+        planList, runBtn,
+        h('h2', { text: '발송 기록' }), logList,
+        h('h2', { text: '실행 기록' }), runsList));
+    });
   }
 
   /* ── 퇴실 기록 ── */
@@ -480,6 +536,37 @@
       box.insertBefore(h('div', null, h('h2', { text: '운영 정보' }), h('div', { class: 'card' }, submitForm([field('상호', inp('text', 'bizName', s.bizName))], '저장', function (d) {
         return api('settings', d).then(function (r) { if (r.ok) { ME.bizName = d.bizName; toast('저장했습니다'); } return r; });
       }), h('p', { class: 'note', style: 'margin-top:8px', text: '발신번호·계좌 문구·문자 문구는 문자 단계에서 추가됩니다.' }))), box.children[1] || null);
+    });
+    // 문자 설정
+    var smsBox = h('div', { class: 'card' });
+    box.appendChild(h('h2', { text: '문자' }));
+    box.appendChild(smsBox);
+    api('sms/settings').then(function (r) {
+      if (!r.ok) return;
+      var c = r.cfg;
+      var tplFields = Object.keys(r.defaults).map(function (k) {
+        var ta = h('textarea', { name: 'tpl_' + k, rows: 5 }, c.templates[k]);
+        var pv = h('pre', { style: 'white-space:pre-wrap;font:inherit;font-size:12px;margin:0;background:var(--bg);padding:8px;border-radius:8px', hidden: true });
+        var btn = h('button', { class: 'link', type: 'button', text: '미리보기', onclick: function () { api('sms/preview', { kind: k, text: ta.value }).then(function (x) { pv.hidden = false; pv.textContent = x.text + '\n\n(' + x.bytes + '바이트 · ' + x.type + ')'; }); } });
+        var reset = h('button', { class: 'link', type: 'button', text: '기본 문구로', onclick: function () { ta.value = r.defaults[k]; } });
+        return h('div', { style: 'display:flex;flex-direction:column;gap:4px' }, h('b', { style: 'font-size:13px', text: r.kinds[k].name }), ta, h('div', { style: 'display:flex;gap:12px' }, btn, reset), pv);
+      });
+      smsBox.appendChild(submitForm([
+        check('testMode', '테스트 모드 (보내지 않고 대상만 기록)', c.testMode),
+        !r.solapi ? h('p', { class: 'note', text: '솔라피가 연결되기 전에는 테스트 모드만 쓸 수 있습니다.' }) : null,
+        field('발신번호', inp('tel', 'senderPhone', c.senderPhone, { placeholder: '솔라피에 등록한 번호' })),
+        field('시험 발송 받을 번호', inp('tel', 'testPhone', c.testPhone, { placeholder: '내 휴대폰' })),
+        field('운영자 알림 번호', inp('text', 'opPhones', (c.opPhones || []).join(', '), { placeholder: '여러 개는 쉼표로' }), 'D+3 미납·입실 확인 알림을 받을 번호'),
+        field('입금계좌 문구', inp('text', 'account', c.account, { placeholder: '예: 국민 123-45-6789 (예금주 엄경환)' }), '비어 있으면 D-1·미납 문자는 보류'),
+        h('div', { class: 'row' }, field('보내기 시작 (시)', inp('number', 'windowStart', c.windowStart)), field('보내기 끝 (시)', inp('number', 'windowEnd', c.windowEnd))),
+        h('p', { class: 'note', text: '문구에 쓸 수 있는 값: {상호} {호실} {이름} {납부일} {금액} {남은금액} {계좌} {퇴실통보일} {입실일} {월세} {보증금} {경과일}' })
+      ].concat(tplFields), '문자 설정 저장', function (d) {
+        var tpl = {};
+        Object.keys(r.defaults).forEach(function (k) { tpl[k] = d['tpl_' + k]; });
+        var body = { testMode: d.testMode, senderPhone: d.senderPhone, testPhone: d.testPhone, opPhones: d.opPhones, account: d.account, windowStart: d.windowStart, windowEnd: d.windowEnd, templates: tpl };
+        if (c.testMode && !d.testMode && !confirm('⚠️ 실제 발송으로 바꿉니다. 내일 오전 9시부터 입실자에게 문자가 갑니다. 계속할까요?')) return Promise.resolve({ ok: false, error: '취소했습니다' });
+        return api('sms/settings', body).then(function (x) { if (x.ok) { toast('저장했습니다'); c.testMode = d.testMode; } return x; });
+      }));
     });
     // 호실
     var roomsBox = h('div', { class: 'card' });

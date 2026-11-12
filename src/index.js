@@ -1,7 +1,8 @@
 /* 고시원 관리 프로그램 – Worker 입구 (검색에 노출되지 않음) */
 import { ensureSchema } from './db.js';
 import { handleApi } from './api.js';
-import { ensureAll } from './ledger.js';
+import { runSms } from './sms.js';
+import { getSetting } from './db.js';
 import { kstToday } from './dates.js';
 
 const NOINDEX = { 'X-Robots-Tag': 'noindex, nofollow' };
@@ -19,9 +20,10 @@ export default {
     }
     return env.ASSETS.fetch(request);
   },
-  // 매일 09:00 (한국 시간): 납부 예정분 만들기 (자동 문자는 5단계에서 추가)
+  // 매일 09:00 (한국 시간): 납부 예정분 만들기 → 자동 문자 (테스트 모드면 대상만 기록)
   async scheduled(event, env, ctx) {
     await ensureSchema(env.DB);
-    ctx.waitUntil(ensureAll(env.DB, kstToday()).catch((e) => console.log('daily failed', e && e.message)));
+    const today = (env.DEV === '1' && (await getSetting(env.DB, 'dev_today', null))) || kstToday();
+    ctx.waitUntil(runSms(env, { trigger: 'cron', today }).catch((e) => console.log('daily failed', e && e.stack)));
   }
 };

@@ -3,6 +3,7 @@ import { hashPassword, verifyPassword, createSession, currentAdmin, deleteSessio
 import { getSetting, setSetting, audit } from './db.js';
 import { kstToday, parseYmd, cycleOnOrBefore, dueDate, addDays } from './dates.js';
 import { ensureCharges, ensureAll, reallocate, chargesOf, creditOf, statusOf } from './ledger.js';
+import { smsSettings, planSms, runSms, KINDS, DEFAULT_TEMPLATES, render, bytes, typeOf, PRICE, mdw } from './sms.js';
 
 const json = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }, headers) });
 const fail = (error, status = 400) => json({ ok: false, error }, status);
@@ -180,8 +181,12 @@ async function dash(env) {
     if (t.checkoutDue) todo.push({ kind: 'checkout', room: r.no, id: t.id, text: r.no + '호 ' + t.name + ' 퇴실 처리 (퇴실예정 ' + t.leave_date + ')' });
     if (t.ledger && t.ledger.code === 'late' && t.ledger.days >= 3) todo.push({ kind: 'call', room: r.no, id: t.id, text: r.no + '호 ' + t.name + ' 미납 ' + manText(t.ledger.owed) + ' · D+' + t.ledger.days + ' 전화 확인' });
   }
+  const cfg = await smsSettings(env.DB);
+  const att = await env.DB.prepare("SELECT COUNT(*) AS n FROM sms_log WHERE status = 'unknown' OR (status = 'failed' AND tries >= 2)").first();
+  if (att && att.n) todo.push({ kind: 'sms', text: '문자 ' + att.n + '건 결과 확인 필요 (실패·응답 없음)' });
+  const lastRun = await env.DB.prepare('SELECT day, at, mode, planned, sent, failed FROM runs ORDER BY id DESC LIMIT 1').first();
   return json({
-    ok: true, today,
+    ok: true, today, sms: { mode: cfg.stop ? 'stopped' : cfg.testMode ? 'test' : 'live', noAccount: !String(cfg.account || '').trim(), lastRun },
     counts: { rooms: real.length, live: live.length, vacant: real.filter((r) => r.state === 'vacant').length, reserved: real.filter((r) => r.state === 'reserved').length, repair: real.filter((r) => r.state === 'repair').length, late: late.length },
     owed: late.reduce((a, r) => a + r.tenant.ledger.owed, 0),
     late: late.map((r) => ({ room: r.no, id: r.tenant.id, name: r.tenant.name, owed: r.tenant.ledger.owed, days: r.tenant.ledger.days })).sort((a, b) => b.days - a.days),
@@ -206,8 +211,9 @@ async function tenantGet(env, id) {
   const { results: allocs } = await db.prepare('SELECT a.payment_id, a.charge_id, a.amount, c.due FROM allocations a JOIN charges c ON c.id = a.charge_id WHERE a.tenant_id = ?').bind(t.id).all();
   const { results: rents } = await db.prepare('SELECT * FROM rent_changes WHERE tenant_id = ? ORDER BY id DESC').bind(t.id).all();
   const { results: log } = await db.prepare('SELECT at, who, action, detail FROM audit WHERE tenant_id = ? ORDER BY id DESC LIMIT 40').bind(t.id).all();
+  const { results: sms } = await db.prepare("SELECT kind, status, created_at, updated_at, err FROM sms_log WHERE tenant_id = ? AND slot = 'T' ORDER BY id DESC LIMIT 20").bind(t.id).all();
   return json({
-    ok: true, today, tenant: t, room, charges: ch.slice().reverse(), payments: pays || [], allocations: allocs || [], rents: rents || [], log: log || [],
+    ok: true, today, tenant: t, room, charges: ch.slice().reverse(), payments: pays || [], allocations: allocs || [], rents: rents || [], log: log || [], sms: sms || [],
     credit: await creditOf(db, t.id), ledger: t.status === 'reserved' || t.status === 'cancelled' ? null : statusOf(t, ch, today)
   });
 }
@@ -493,8 +499,105 @@ async function roomDelete(env, admin, b) {
   return json({ ok: true });
 }
 
+/* ── 자동 문자 ── */
+function phoneList(v) {
+  const arr = (Array.isArray(v) ? v : String(v || '').split(/[,\n]/)).map((x) => x.trim()).filter(Boolean).slice(0, 5);
+  return arr.map(phoneOf);
+}
+async function smsStatus(env) {
+  const db = env.DB;
+  const today = await todayOf(env);
+  await ensureToday(env, today);
+  const cfg = await smsSettings(db);
+  const items = await planSms(db, today, cfg);
+  const { results: log } = await db.prepare('SELECT l.id, l.kind, l.to_phone, l.text, l.status, l.tries, l.msg_type, l.cost, l.err, l.created_at, l.updated_at, l.tenant_id, t.name, r.no AS room FROM sms_log l LEFT JOIN tenants t ON t.id = l.tenant_id LEFT JOIN rooms r ON r.id = t.room_id ORDER BY l.id DESC LIMIT 60').all();
+  const { results: runs } = await db.prepare('SELECT id, day, at, trigger, mode, planned, sent, failed, blocked, note FROM runs ORDER BY id DESC LIMIT 15').all();
+  const month = today.slice(0, 7);
+  const m = await db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(cost), 0) AS cost FROM sms_log WHERE status = 'sent' AND strftime('%Y-%m', updated_at, '+9 hours') = ?").bind(month).first();
+  const attention = (log || []).filter((l) => l.status === 'unknown' || (l.status === 'failed' && l.tries >= 2)).length;
+  return json({
+    ok: true, today,
+    mode: cfg.stop ? 'stopped' : cfg.testMode ? 'test' : 'live',
+    cfg: { senderPhone: cfg.senderPhone, account: cfg.account, opPhones: cfg.opPhones, windowStart: cfg.windowStart, windowEnd: cfg.windowEnd, solapi: !!(env.SOLAPI_KEY && env.SOLAPI_SECRET) || env.SMS_MOCK === '1' },
+    plan: items.map((i) => ({ room: i.room, name: i.name, kind: i.kind, kindName: KINDS[i.kind].name, to: i.to, due: i.due, text: i.text, type: i.type, blocked: i.blocked, retry: !!i.retryOf, tenant_id: i.tenant_id })),
+    estimate: items.filter((i) => !i.blocked).reduce((a, i) => a + PRICE[i.type], 0),
+    month: { count: m.n, cost: m.cost }, attention, log: log || [], runs: runs || []
+  });
+}
+async function smsSettingsGet(env) {
+  const cfg = await smsSettings(env.DB);
+  return json({ ok: true, cfg, kinds: KINDS, defaults: DEFAULT_TEMPLATES, solapi: !!(env.SOLAPI_KEY && env.SOLAPI_SECRET) || env.SMS_MOCK === '1' });
+}
+async function smsSettingsSave(env, admin, b) {
+  const db = env.DB;
+  const cur = await smsSettings(db);
+  const next = Object.assign({}, cur);
+  if (b.senderPhone != null) next.senderPhone = b.senderPhone ? phoneOf(b.senderPhone) : '';
+  if (b.testPhone != null) next.testPhone = b.testPhone ? phoneOf(b.testPhone) : '';
+  if (b.opPhones != null) next.opPhones = phoneList(b.opPhones);
+  if (b.account != null) next.account = str(b.account, 80);
+  if (b.windowStart != null) {
+    const a = Number(b.windowStart), z = Number(b.windowEnd);
+    if (!(a >= 7 && a <= 12 && z >= a + 1 && z <= 21)) bad('발송 시간대는 오전 7~12시 시작, 밤 9시 전에 끝나게 정해 주세요');
+    next.windowStart = a; next.windowEnd = z;
+  }
+  if (b.templates) {
+    next.templates = Object.assign({}, cur.templates);
+    for (const k of Object.keys(DEFAULT_TEMPLATES)) if (b.templates[k] != null) {
+      const t = String(b.templates[k]).slice(0, 1000).trim();
+      next.templates[k] = t || DEFAULT_TEMPLATES[k];
+    }
+  }
+  const changes = [];
+  if (b.testMode != null && !!b.testMode !== cur.testMode) {
+    if (!b.testMode) {
+      if (!(env.SOLAPI_KEY && env.SOLAPI_SECRET) && env.SMS_MOCK !== '1') bad('솔라피 키가 아직 없어 실제 발송으로 바꿀 수 없습니다');
+      if (!next.senderPhone) bad('발신번호를 먼저 입력해 주세요');
+    }
+    next.testMode = !!b.testMode;
+    changes.push(b.testMode ? '테스트 모드 켬' : '⚠️ 실제 발송 시작');
+  }
+  await setSetting(db, 'sms', next, admin.name);
+  await audit(db, admin, '문자 설정 저장', changes.join(', ') || '번호·계좌·문구');
+  return json({ ok: true });
+}
+async function smsStop(env, admin, b) {
+  const cfg = await smsSettings(env.DB);
+  cfg.stop = !!b.stop;
+  await setSetting(env.DB, 'sms', cfg, admin.name);
+  await audit(env.DB, admin, b.stop ? '⛔ 자동 문자 긴급 정지' : '자동 문자 다시 시작', '');
+  return json({ ok: true });
+}
+async function smsRun(env, admin) {
+  const cfg = await smsSettings(env.DB);
+  if (!cfg.testMode && !cfg.stop && admin.role !== 'owner') bad('실제 발송 모드에서는 최고 관리자만 수동 실행할 수 있습니다');
+  const r = await runSms(env, { trigger: 'manual', today: await todayOf(env), admin });
+  return json({ ok: true, result: { mode: r.mode, planned: r.planned, sent: r.sent || 0, failed: r.failed || 0, blocked: r.blocked || 0, skipped: r.skipped } });
+}
+// '결과 확인 필요' · 재시도 다 쓴 실패 처리: 실제로 갔으면 sent, 다시 보내려면 resend(다음 실행 때 1번)
+async function smsResolve(env, admin, b) {
+  const db = env.DB;
+  const l = await db.prepare('SELECT * FROM sms_log WHERE id = ?').bind(Number(b.id)).first();
+  if (!l) bad('기록을 찾지 못했습니다');
+  if (!['unknown', 'failed'].includes(l.status)) bad('확인할 필요가 없는 기록입니다');
+  if (b.result === 'sent') await db.prepare("UPDATE sms_log SET status = 'sent', err = COALESCE(err, '') || ' → 관리자 확인: 보내짐', updated_at = datetime('now') WHERE id = ?").bind(l.id).run();
+  else if (b.result === 'resend') await db.prepare("UPDATE sms_log SET status = 'failed', tries = 1, err = COALESCE(err, '') || ' → 관리자: 다시 보내기', updated_at = datetime('now') WHERE id = ?").bind(l.id).run();
+  else if (b.result === 'drop') await db.prepare("UPDATE sms_log SET status = 'cancelled', err = COALESCE(err, '') || ' → 관리자: 보내지 않음', updated_at = datetime('now') WHERE id = ?").bind(l.id).run();
+  else bad('처리 방법을 골라 주세요');
+  await audit(db, admin, '문자 결과 처리', ({ sent: '보내짐으로', resend: '다시 보내기', drop: '보내지 않음' })[b.result], { tenant: l.tenant_id || null });
+  return json({ ok: true });
+}
+async function smsPreview(env, b) {
+  const cfg = await smsSettings(env.DB);
+  const biz = (await getSetting(env.DB, 'bizName', '')) || '';
+  const due = addDays(await todayOf(env), 10);
+  const v = { 상호: biz, 호실: '301', 이름: '홍길동', 납부일: mdw(due), 금액: '32만원', 남은금액: '32만원', 계좌: str(b.account, 80) || cfg.account || '(계좌 문구)', 퇴실통보일: mdw(addDays(due, -7)), 입실일: mdw(await todayOf(env)), 월세: '32만원', 보증금: '50만원', 경과일: 3 };
+  const text = render(str(b.text, 1000) || DEFAULT_TEMPLATES[b.kind] || '', v);
+  return json({ ok: true, text, bytes: bytes(text), type: typeOf(text) });
+}
+
 /* ── 입구 ── */
-const OWNER_ONLY = new Set(['invite', 'admin/active', 'settings', 'room/save', 'room/delete', 'admins']);
+const OWNER_ONLY = new Set(['invite', 'admin/active', 'settings', 'room/save', 'room/delete', 'admins', 'sms/settings']);
 export async function handleApi(request, env, path) {
   const db = env.DB;
   const url = new URL(request.url);
@@ -527,6 +630,11 @@ export async function handleApi(request, env, path) {
       if (path === 'settings') return await settingsSave(env, admin, b);
       if (path === 'room/save') return await roomSave(env, admin, b);
       if (path === 'room/delete') return await roomDelete(env, admin, b);
+      if (path === 'sms/settings') return await smsSettingsSave(env, admin, b);
+      if (path === 'sms/stop') return await smsStop(env, admin, b);
+      if (path === 'sms/run') return await smsRun(env, admin);
+      if (path === 'sms/resolve') return await smsResolve(env, admin, b);
+      if (path === 'sms/preview') return await smsPreview(env, b);
       if (path === 'dev/today' && env.DEV === '1') { await setSetting(db, 'dev_today', b.date ? dateOf(b.date, '시험') : null); return json({ ok: true }); }
       return fail('없는 기능입니다', 404);
     }
@@ -544,6 +652,8 @@ export async function handleApi(request, env, path) {
       if (path === 'audit') return await auditList(env);
       if (path === 'admins') return await adminsGet(env);
       if (path === 'settings') return await settingsGet(env);
+      if (path === 'sms') return await smsStatus(env);
+      if (path === 'sms/settings') return await smsSettingsGet(env);
       return fail('없는 기능입니다', 404);
     }
     return fail('없는 기능입니다', 404);
