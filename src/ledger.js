@@ -1,5 +1,5 @@
 /* 장부 – 납부 예정분 만들기, 입금 배정, 입실자별 상태 */
-import { dueDate, cycleOnOrBefore, addDays } from './dates.js';
+import { addDays, tenantDue, tenantIndex } from './dates.js';
 import { allocate, ledgerStatus } from './ledger-core.js';
 
 export const LEAD_DAYS = 10; // 납부일 10일 전에 납부 예정분을 만듦 (D-10 문자와 같은 날)
@@ -14,7 +14,7 @@ export async function ensureCharges(db, t, today) {
   const limit = addDays(today, LEAD_DAYS);
   const stmts = [];
   for (let n = 0; n < 36; n++, k++) {
-    const due = dueDate(t.move_in, k);
+    const due = tenantDue(t, k);
     if (due > limit) break;
     if (t.leave_date && due >= t.leave_date) break;
     stmts.push(db.prepare('INSERT OR IGNORE INTO charges (tenant_id, k, due, amount) VALUES (?, ?, ?, ?)').bind(t.id, k, due, t.rent));
@@ -63,7 +63,7 @@ export async function creditOf(db, tenantId) {
 export function statusOf(t, charges, today) {
   const s = ledgerStatus(charges || [], today);
   // 다음 납부일: 아직 안 받은 가장 오래된 납부일, 다 받았으면 다음 회차
-  const k = cycleOnOrBefore(t.move_in, today);
-  s.nextDue = s.due || dueDate(t.move_in, Math.max(k + 1, t.ledger_from || 0, (charges && charges.length ? charges[charges.length - 1].k + 1 : 0)));
+  const k = tenantIndex(t, today);
+  s.nextDue = s.due || tenantDue(t, Math.max(k + 1, t.ledger_from || 0, (charges && charges.length ? charges[charges.length - 1].k + 1 : 0)));
   return s;
 }

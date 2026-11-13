@@ -59,8 +59,8 @@ export async function exportCsv(env, what, today) {
   if (what === 'tenants') {
     const { results } = await db.prepare('SELECT t.*, r.no AS room FROM tenants t JOIN rooms r ON r.id = t.room_id ORDER BY r.sort, r.no, t.id').all();
     const ch = await chargesOf(db, (results || []).map((t) => t.id));
-    head = ['호실', '이름', '전화', '상태', '입실일', '퇴실예정일', '퇴실일', '월세(만원)', '보증금(만원)', '미납(만원)', '성별', '현금영수증', '문자 제외', '보증금 반환', '보증금 공제', '공제 사유', '비고'];
-    rows = (results || []).map((t) => [t.room, t.name, t.phone, STATUS[t.status], t.move_in, t.leave_date, t.out_date, man(t.rent), man(t.deposit),
+    head = ['호실', '이름', '전화', '상태', '계약 단위', '입실일', '퇴실예정일', '퇴실일', '금액(만원)', '보증금(만원)', '미납(만원)', '성별', '현금영수증', '문자 제외', '보증금 반환', '보증금 공제', '공제 사유', '비고'];
+    rows = (results || []).map((t) => [t.room, t.name, t.phone, STATUS[t.status], t.cycle === '2w' ? '2주' : '월', t.move_in, t.leave_date, t.out_date, man(t.rent), man(t.deposit),
       man((ch[t.id] || []).filter((c) => !c.void && c.due <= today).reduce((a, c) => a + c.amount - c.paid, 0)), t.gender, t.cash_receipt ? 'O' : '', t.sms_off ? 'O' : '', man(t.dep_refund), man(t.dep_deduct), t.dep_note, t.memo]);
   } else if (what === 'arrears') {
     const { results } = await db.prepare("SELECT c.due, c.amount, COALESCE((SELECT SUM(a.amount) FROM allocations a WHERE a.charge_id = c.id), 0) AS paid, t.name, t.phone, t.status, r.no AS room FROM charges c JOIN tenants t ON t.id = c.tenant_id JOIN rooms r ON r.id = t.room_id WHERE c.void = 0 AND c.due <= ? ORDER BY r.no, c.due").bind(today).all();

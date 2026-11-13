@@ -3,7 +3,9 @@
    - 마스터(비번)는 보내지 않음 (노션에 남아 있던 값은 지움)
    - 실패해도 사이트 데이터에는 영향 없음 → 대기열에 남겨 다시 시도 */
 import { getSetting, setSetting, audit } from './db.js';
-import { kstToday, parseYmd, cycleOnOrBefore, dueDate } from './dates.js';
+import { kstToday, parseYmd, cycleIndex, dueByCycle } from './dates.js';
+
+export const TWO_WEEK_MAX = 220000; // 이 금액 이하면 2주 계약으로 먼저 골라 둠 (화면에서 바꿀 수 있음)
 import { ensureCharges, chargesOf, statusOf } from './ledger.js';
 
 const VER = '2022-06-28';
@@ -67,14 +69,18 @@ export async function importPreview(env, today = kstToday()) {
       if (!(r.rent > 0)) issues.push('월세 없음');
       if (r.state !== '입실예정' && parseYmd(r.move_in) && r.move_in > today) issues.push('입실일이 미래인데 상태가 ' + r.state);
     }
-    // 노션 '입금' 체크는 가장 최근 납부일(오늘 이전) 몫으로 처리
-    const living = occupied && r.state !== '입실예정' && parseYmd(r.move_in) && r.move_in <= today;
-    const paidFor = living && r.paid ? dueDate(r.move_in, Math.max(0, cycleOnOrBefore(r.move_in, today))) : '';
-    return { no: r.no, state: r.state || '공실', type: r.type, name: r.name, phone: r.phone, move_in: r.move_in, rent: r.rent, deposit: r.deposit, paid: r.paid, paidFor, sms_off: r.sms_off, issues, occupied, _r: r };
+    // 계약 단위: 22만원 이하면 2주로 먼저 골라 둠
+    const cycle = r.rent > 0 && r.rent * 10000 <= TWO_WEEK_MAX ? '2w' : 'month';
+    // 가장 최근 납부일(오늘 이전) 몫을 받았는지: 노션 '입금'은 매월 초 전체 해제 →
+    // 그 납부일이 이번 달 1일 전이면 받은 것으로, 이번 달이면 노션 체크대로 (화면에서 줄마다 바꿀 수 있음)
+    const living = !!(occupied && r.state !== '입실예정' && parseYmd(r.move_in) && r.move_in <= today);
+    const paidFor = living ? dueByCycle(cycle, r.move_in, Math.max(0, cycleIndex(cycle, r.move_in, today))) : '';
+    const paidDefault = living ? (paidFor < today.slice(0, 8) + '01' ? true : !!r.paid) : false;
+    return { no: r.no, state: r.state || '공실', type: r.type, name: r.name, phone: r.phone, move_in: r.move_in, rent: r.rent, deposit: r.deposit, paid: r.paid, paidFor, paidDefault, cycle, living, sms_off: r.sms_off, issues, occupied, _r: r };
   }).sort((a, b) => (a.no < b.no ? -1 : 1));
   return plan;
 }
-export async function importRun(env, admin, today = kstToday()) {
+export async function importRun(env, admin, today = kstToday(), choices = {}) {
   const db = env.DB;
   const any = await db.prepare('SELECT COUNT(*) AS n FROM tenants').first();
   if (any.n > 0) throw new Error('이미 입실자가 있어 가져올 수 없습니다 (처음 한 번만 가능)');
@@ -94,21 +100,25 @@ export async function importRun(env, admin, today = kstToday()) {
     if (!p.occupied) continue;
     const living = r.state !== '입실예정';
     const rent = Math.round(r.rent * 10000);
-    const from = living ? Math.max(0, cycleOnOrBefore(r.move_in, today)) : 0;
-    const ins = await db.prepare('INSERT INTO tenants (room_id, name, phone, move_in, rent, deposit, gender, master, cash_receipt, memo, sms_off, status, ledger_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .bind(room.id, r.name, fmtPhone(r.phone), r.move_in, rent, Math.round((r.deposit || 0) * 10000), ['남', '여'].includes(r.gender) ? r.gender : '', r.master, r.cash_receipt ? 1 : 0, r.memo, r.sms_off ? 1 : 0, living ? (r.state === '퇴실예정' ? 'leaving' : 'in') : 'reserved', from).run();
+    const ch = choices[r.no] || {};
+    const cycle = ch.cycle === '2w' || ch.cycle === 'month' ? ch.cycle : p.cycle;
+    const paid = typeof ch.paid === 'boolean' ? ch.paid : p.paidDefault;
+    const from = living ? Math.max(0, cycleIndex(cycle, r.move_in, today)) : 0;
+    const paidFor = living ? dueByCycle(cycle, r.move_in, from) : '';
+    const ins = await db.prepare('INSERT INTO tenants (room_id, name, phone, move_in, rent, deposit, gender, master, cash_receipt, memo, sms_off, status, ledger_from, cycle, anchor, k_base) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)')
+      .bind(room.id, r.name, fmtPhone(r.phone), r.move_in, rent, Math.round((r.deposit || 0) * 10000), ['남', '여'].includes(r.gender) ? r.gender : '', r.master, r.cash_receipt ? 1 : 0, r.memo, r.sms_off ? 1 : 0, living ? (r.state === '퇴실예정' ? 'leaving' : 'in') : 'reserved', from, cycle, r.move_in).run();
     const t = await db.prepare('SELECT * FROM tenants WHERE id = ?').bind(ins.meta.last_row_id).first();
     tenants++;
     if (living) {
       await ensureCharges(db, t, today);
-      // 노션 '입금' 체크 = 이번 회차 받음
-      if (r.paid) {
-        await db.prepare("INSERT INTO payments (tenant_id, paid_on, amount, method, memo, by_name) VALUES (?, ?, ?, '기존', ?, ?)").bind(t.id, p.paidFor || today, rent, '노션에서 가져옴: ' + p.paidFor + '분 입금 체크', admin.name).run();
+      // 이번 회차(가장 최근 납부일) 받음
+      if (paid) {
+        await db.prepare("INSERT INTO payments (tenant_id, paid_on, amount, method, memo, by_name) VALUES (?, ?, ?, '기존', ?, ?)").bind(t.id, paidFor, rent, '노션에서 가져옴: ' + paidFor + '분 받음', admin.name).run();
         const { reallocate } = await import('./ledger.js');
         await reallocate(db, t.id);
       }
     }
-    await audit(db, admin, '노션에서 가져옴', r.no + '호 ' + r.name + ' · ' + r.state + (r.paid ? ' · 입금 체크' : ''), { tenant: t.id, room: room.id });
+    await audit(db, admin, '노션에서 가져옴', r.no + '호 ' + r.name + ' · ' + r.state + ' · ' + (cycle === '2w' ? '2주' : '월') + (living ? ' · ' + paidFor + '분 ' + (paid ? '받음' : '미입금') : ''), { tenant: t.id, room: room.id });
   }
   return { rooms, tenants, notionRows: plan.length };
 }
@@ -145,7 +155,7 @@ async function roomProps(env, room) {
   const hide = !!t.notion_off; // 본인이 국외 이전을 원하지 않음 → 이름·전화·비고 보내지 않음
   Object.assign(props, {
     이름: rt(hide ? '(비공개)' : t.name), 전화번호: { phone_number: hide ? null : t.phone }, 입실일: { date: { start: t.move_in } }, 월세: { number: t.rent / 10000 }, 보증금: { number: t.deposit / 10000 },
-    성별: t.gender ? { select: { name: t.gender } } : { select: null }, 입금: { checkbox: paid }, 현금영수증: { checkbox: !!t.cash_receipt }, 비고: rt(hide ? '' : t.memo), '문자 제외': { checkbox: !!t.sms_off },
+    성별: t.gender ? { select: { name: t.gender } } : { select: null }, 입금: { checkbox: paid }, 현금영수증: { checkbox: !!t.cash_receipt }, 비고: rt(((t.cycle === '2w') ? '[2주 계약] ' : '') + (hide ? '' : t.memo || '')), '문자 제외': { checkbox: !!t.sms_off },
     안내기록: rt(smsText)
   });
   return props;

@@ -16,6 +16,7 @@ const SCHEMA = [
     memo TEXT, sms_off INTEGER NOT NULL DEFAULT 0, notion_off INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL CHECK (status IN ('reserved', 'in', 'leaving', 'out', 'cancelled')),
     ledger_from INTEGER NOT NULL DEFAULT 0, leave_date TEXT, out_date TEXT,
+    cycle TEXT NOT NULL DEFAULT 'month', anchor TEXT, k_base INTEGER NOT NULL DEFAULT 0,
     dep_refund INTEGER, dep_deduct INTEGER, dep_note TEXT, dep_done_at TEXT,
     anon_at TEXT, notion_id TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
   `CREATE INDEX IF NOT EXISTS tenants_room ON tenants (room_id, status)`,
@@ -47,10 +48,21 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL DEFAULT (datetime('now')), admin_id INTEGER, who TEXT, action TEXT NOT NULL, detail TEXT, tenant_id INTEGER, room_id INTEGER)`,
   `CREATE INDEX IF NOT EXISTS audit_tenant ON audit (tenant_id)`
 ];
+// 나중에 추가한 칸 (이미 설치된 데이터베이스용)
+const ADD_COLUMNS = [
+  ['tenants', 'notion_off', "INTEGER NOT NULL DEFAULT 0"],
+  ['tenants', 'cycle', "TEXT NOT NULL DEFAULT 'month'"],
+  ['tenants', 'anchor', 'TEXT'],
+  ['tenants', 'k_base', 'INTEGER NOT NULL DEFAULT 0']
+];
 let ready = false;
 export async function ensureSchema(db) {
   if (ready || !db) return;
   await db.batch(SCHEMA.map((s) => db.prepare(s)));
+  for (const [t, c, def] of ADD_COLUMNS) {
+    const cols = ((await db.prepare('PRAGMA table_info(' + t + ')').all()).results || []).map((x) => x.name);
+    if (!cols.includes(c)) await db.prepare('ALTER TABLE ' + t + ' ADD COLUMN ' + c + ' ' + def).run();
+  }
   ready = true;
 }
 export async function getSetting(db, key, fallback = null) {

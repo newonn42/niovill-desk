@@ -1,4 +1,4 @@
-import { dueDate, cycleOnOrBefore, nextDueOnOrAfter, addDays, diffDays } from '../src/dates.js';
+import { dueDate, cycleOnOrBefore, nextDueOnOrAfter, addDays, diffDays, dueByCycle, cycleIndex, tenantDue, tenantIndex } from '../src/dates.js';
 import { allocate, ledgerStatus } from '../src/ledger-core.js';
 let fail = 0, n = 0;
 const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -21,6 +21,16 @@ check('next 3/1', nextDueOnOrAfter('2026-01-31', '2026-03-01'), '2026-03-31');
 check('next 당일', nextDueOnOrAfter('2026-01-31', '2026-02-28'), '2026-02-28');
 check('addDays', addDays('2026-02-25', 5), '2026-03-02');
 check('diffDays', diffDays('2026-03-02', '2026-02-25'), 5);
+
+// 2주 단위
+check('2주 납부일', [0, 1, 2, 3].map((j) => dueByCycle('2w', '2026-11-20', j)), ['2026-11-20', '2026-12-04', '2026-12-18', '2027-01-01']);
+check('2주 회차 (당일)', cycleIndex('2w', '2026-11-20', '2026-12-04'), 1);
+check('2주 회차 (전날)', cycleIndex('2w', '2026-11-20', '2026-12-03'), 0);
+check('2주 회차 (시작 전)', cycleIndex('2w', '2026-11-20', '2026-11-19'), -1);
+// 계약 단위 변경: 2주(0~3회차) → 1/15부터 월 단위 (k_base 4)
+const T = { cycle: 'month', anchor: '2027-01-15', k_base: 4, move_in: '2026-11-20' };
+check('변경 후 납부일', [4, 5, 6].map((k) => tenantDue(T, k)), ['2027-01-15', '2027-02-15', '2027-03-15']);
+check('변경 후 회차', tenantIndex(T, '2027-02-20'), 5);
 
 // 입금 배정: 오래된 납부분부터, 남으면 선입금
 const C = (id, due, amount) => ({ id, due, amount });

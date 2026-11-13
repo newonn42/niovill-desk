@@ -49,3 +49,21 @@ export function nextDueOnOrAfter(moveIn, date) {
   if (k >= 0 && dueDate(moveIn, k) === date) return date;
   return dueDate(moveIn, k + 1);
 }
+
+/* 계약 단위: 'month' = 매달 같은 날, '2w' = 14일마다 */
+export const TWO_WEEKS = 14;
+export function dueByCycle(cycle, anchor, j) {
+  return cycle === '2w' ? addDays(anchor, TWO_WEEKS * j) : dueDate(anchor, j);
+}
+// date 이전(같은 날 포함)의 마지막 납부일 번호. 시작 전이면 -1
+export function cycleIndex(cycle, anchor, date) {
+  if (date < anchor) return -1;
+  return cycle === '2w' ? Math.floor(diffDays(date, anchor) / TWO_WEEKS) : cycleOnOrBefore(anchor, date);
+}
+// 입실자 t의 k번째 납부일 (계약 단위를 바꾸면 anchor·k_base부터 새 주기)
+export function tenantDue(t, k) {
+  return dueByCycle(t.cycle || 'month', t.anchor || t.move_in, k - (t.k_base || 0));
+}
+export function tenantIndex(t, date) {
+  return (t.k_base || 0) + cycleIndex(t.cycle || 'month', t.anchor || t.move_in, date);
+}
