@@ -37,7 +37,7 @@ function readRow(page) {
   return {
     notion_id: page.id, no: plain(P['호실']), state: sel('상태'), name: plain(P['이름']), phone: (P['전화번호'] && P['전화번호'].phone_number) || '',
     move_in: (P['입실일'] && P['입실일'].date && P['입실일'].date.start || '').slice(0, 10), rent: num('월세'), deposit: num('보증금'), type: sel('타입'), gender: sel('성별'),
-    master: plain(P['마스터']), paid: chk('입금'), cash_receipt: chk('현금영수증'), memo: plain(P['비고']), sms_off: chk('문자 제외')
+    master: plain(P['마스터']), cycle: sel('계약 단위') === '2주' ? '2w' : 'month', paid: chk('입금'), cash_receipt: chk('현금영수증'), memo: plain(P['비고']), sms_off: chk('문자 제외')
   };
 }
 async function readAll(env, dbId) {
@@ -68,8 +68,8 @@ export async function importPreview(env, today = kstToday()) {
       if (!(r.rent > 0)) issues.push('월세 없음');
       if (r.state !== '입실예정' && parseYmd(r.move_in) && r.move_in > today) issues.push('입실일이 미래인데 상태가 ' + r.state);
     }
-    // 계약 단위: 기본 월 단위 (2주 계약은 미리보기에서 체크)
-    const cycle = 'month';
+    // 계약 단위: 노션 '계약 단위' 칸이 2주면 2주, 아니면 월 (미리보기에서 체크로 바꿀 수 있음)
+    const cycle = r.cycle;
     // 가장 최근 납부일(오늘 이전) 몫을 받았는지: 노션 '입금'은 매월 초 전체 해제 →
     // 그 납부일이 이번 달 1일 전이면 받은 것으로, 이번 달이면 노션 체크대로 (화면에서 줄마다 바꿀 수 있음)
     const living = !!(occupied && r.state !== '입실예정' && parseYmd(r.move_in) && r.move_in <= today);
@@ -123,6 +123,21 @@ export async function importRun(env, admin, today = kstToday(), choices = {}) {
 }
 
 /* ── 동기화 ── */
+// 노션 DB에 실제로 있는 칸 이름 (하루 한 번 새로 읽음) → 없는 칸은 보내지 않음 (다른 고시원 노션 호환)
+async function propsOf(env, dbId) {
+  const key = 'notionProps:' + dbId;
+  const c = await getSetting(env.DB, key, null);
+  if (c && Date.now() - c.t < 24 * 3600 * 1000) return new Set(c.names);
+  const d = await nf(env, 'databases/' + dbId);
+  const names = Object.keys(d.properties || {});
+  await setSetting(env.DB, key, { t: Date.now(), names });
+  return new Set(names);
+}
+function only(props, names) {
+  const out = {};
+  for (const k of Object.keys(props)) if (names.has(k)) out[k] = props[k];
+  return out;
+}
 export async function enqueue(db, kind, id) {
   if (!id) return;
   await db.prepare('INSERT OR IGNORE INTO notion_queue (kind, ref_id) VALUES (?, ?)').bind(kind, id).run();
@@ -141,21 +156,27 @@ async function roomProps(env, room) {
     마스터: rt('') // 사이트에만 보관
   };
   if (!t) {
-    Object.assign(props, { 이름: rt(''), 전화번호: { phone_number: null }, 입실일: { date: null }, 월세: { number: null }, 보증금: { number: null }, 성별: { select: null }, 입금: { checkbox: false }, 현금영수증: { checkbox: false }, 비고: rt(room.repair ? '수리중' : ''), '문자 제외': { checkbox: false }, 안내기록: rt('') });
+    Object.assign(props, { 이름: rt(''), 전화번호: { phone_number: null }, 입실일: { date: null }, 월세: { number: null }, 보증금: { number: null }, 성별: { select: null }, 입금: { checkbox: false }, 현금영수증: { checkbox: false }, 비고: rt(room.repair ? '수리중' : ''), '문자 제외': { checkbox: false }, 안내기록: rt(''),
+      '다음 납부일': { date: null }, '계약 단위': { select: null }, 미납: { number: null }, 퇴실예정일: { date: null } });
     return props;
   }
-  let paid = false;
+  let paid = false, nextDue = null, owed = null;
   if (t.status !== 'reserved') {
     const ch = (await chargesOf(db, [t.id]))[t.id] || [];
-    paid = statusOf(t, ch, kstToday()).code === 'paid';
+    const st = statusOf(t, ch, kstToday());
+    paid = st.code === 'paid';
+    nextDue = st.nextDue || null;
+    owed = st.owed ? st.owed / 10000 : 0;
   }
   const { results: sms } = await db.prepare("SELECT kind, status, updated_at FROM sms_log WHERE tenant_id = ? AND slot = 'T' ORDER BY id DESC LIMIT 3").bind(t.id).all();
   const smsText = (sms || []).map((x) => new Date(x.updated_at.replace(' ', 'T') + 'Z').toISOString().slice(5, 10).replace('-', '/') + ' ' + (KIND_KO[x.kind] || x.kind) + (x.status === 'sent' ? '' : '(' + x.status + ')')).join(', ');
   const hide = !!t.notion_off; // 본인이 국외 이전을 원하지 않음 → 이름·전화·비고 보내지 않음
   Object.assign(props, {
     이름: rt(hide ? '(비공개)' : t.name), 전화번호: { phone_number: hide ? null : t.phone }, 입실일: { date: { start: t.move_in } }, 월세: { number: t.rent / 10000 }, 보증금: { number: t.deposit / 10000 },
-    성별: t.gender ? { select: { name: t.gender } } : { select: null }, 입금: { checkbox: paid }, 현금영수증: { checkbox: !!t.cash_receipt }, 비고: rt(((t.cycle === '2w') ? '[2주 계약] ' : '') + (hide ? '' : t.memo || '')), '문자 제외': { checkbox: !!t.sms_off },
-    안내기록: rt(smsText)
+    성별: t.gender ? { select: { name: t.gender } } : { select: null }, 입금: { checkbox: paid }, 현금영수증: { checkbox: !!t.cash_receipt }, 비고: rt(hide ? '' : t.memo || ''), '문자 제외': { checkbox: !!t.sms_off },
+    안내기록: rt(smsText),
+    '다음 납부일': { date: nextDue ? { start: nextDue } : null }, '계약 단위': { select: { name: t.cycle === '2w' ? '2주' : '월' } },
+    미납: { number: owed }, 퇴실예정일: { date: t.leave_date ? { start: t.leave_date } : null }
   });
   return props;
 }
@@ -192,7 +213,8 @@ async function syncOne(env, item) {
   if (item.kind === 'room') {
     const room = await db.prepare('SELECT * FROM rooms WHERE id = ?').bind(item.ref_id).first();
     if (!room) return;
-    const props = await roomProps(env, room);
+    const dbId0 = dbIdOf(await getSetting(db, 'notionRoomsDb', ''));
+    const props = only(await roomProps(env, room), await propsOf(env, dbId0));
     if (room.notion_id) {
       await nf(env, 'pages/' + room.notion_id, 'PATCH', { properties: props });
     } else {
@@ -236,6 +258,8 @@ export async function processQueue(env, max = 8) {
   return { ok, failed };
 }
 export async function enqueueAll(db) {
+  const { results: keys } = await db.prepare("SELECT key FROM settings WHERE key LIKE 'notionProps:%'").all();
+  for (const k of keys || []) await db.prepare('DELETE FROM settings WHERE key = ?').bind(k.key).run();
   const { results: rooms } = await db.prepare('SELECT id FROM rooms').all();
   for (const r of rooms || []) await enqueue(db, 'room', r.id);
   const { results: outs } = await db.prepare("SELECT id FROM tenants WHERE status IN ('out', 'cancelled')").all();

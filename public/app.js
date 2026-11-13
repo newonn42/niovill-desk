@@ -626,7 +626,7 @@
                   var c = ctl[y.no] = {};
                   var cyc = null, pd = null;
                   if (y.occupied && !y.issues.length) {
-                    cyc = h('label', { class: 'c', style: 'font-size:13px;font-weight:500' }, c.two = h('input', { type: 'checkbox' }), '2주');
+                    cyc = h('label', { class: 'c', style: 'font-size:13px;font-weight:500' }, c.two = h('input', { type: 'checkbox', checked: y.cycle === '2w' }), '2주');
                     if (y.living) pd = h('label', { class: 'c', style: 'font-size:13px;font-weight:500' }, c.paid = h('input', { type: 'checkbox', checked: y.paidDefault }), md(y.paidFor) + '분 받음');
                   }
                   return h('tr', null, h('td', { text: y.no }), h('td', null, y.state, h('br'), h('small', { text: y.name || '' })), h('td', { text: y.rent != null && y.occupied ? y.rent : '' }),

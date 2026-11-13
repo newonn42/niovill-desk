@@ -51,6 +51,11 @@ nl=[x for x in lines('notion.log') if x['op']=='patch']
 ok('노션 18줄 덮어쓰기', len({x['id'] for x in nl})==18, len({x['id'] for x in nl}))
 ok('마스터는 빈칸으로 보냄 (노션에서 지움)', all(x['props']['마스터']['rich_text']==[] for x in nl))
 p201=[x for x in nl if x['id']=='page-201'][-1]['props']; ok('노션 값: 이름·월세(만원)·입금', p201['이름']['rich_text'][0]['text']['content']=='김가람' and p201['월세']['number']==30 and '입금' in p201)
+ok('노션 새 칸: 다음 납부일·계약 단위·미납·퇴실예정일', p201['다음 납부일']['date'] and p201['계약 단위']['select']['name']=='월' and p201['미납']['number'] is not None and '퇴실예정일' in p201, {k:p201.get(k) for k in ['다음 납부일','계약 단위','미납','퇴실예정일']})
+nstate(newCols=False); call('notion/resync',{}); call('notion/sync',{}); call('notion/sync',{})
+last=[x for x in lines('notion.log') if x['op']=='patch'][-1]['props']
+ok('새 칸이 없는 노션(다른 고시원)에는 그 칸을 빼고 보냄', '계약 단위' not in last and '이름' in last and call('notion')['queue']['waiting']==0, (list(last.keys()), call('notion')['queue']))
+nstate(newCols=True)
 ok('퇴실 기록 DB 만들기', call('notion/outdb',{})['ok'])
 cdb=[x for x in lines('notion.log') if x['op']=='createdb']; ok('입실자 현황과 같은 페이지 아래에 생성', cdb and cdb[-1]['parent']['page_id']=='3f880bd3fbaf80b4b707cfe993cc9c3d' and '이름' in cdb[-1]['props'])
 tid=by['303']['tenant']['id']
