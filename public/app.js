@@ -37,18 +37,6 @@
     return v.toLocaleString('ko-KR') + '만원';
   }
   function rentText(t) { return (t.cycle === '2w' ? '2주 ' : '월세 ') + man(t.rent); }
-  var TWO_WEEK_MAX = 22; // 만원. 이 금액 이하면 2주 계약으로 먼저 골라 둠
-  // 금액을 입력하면 22만원 이하일 때 2주로 자동 선택 (사용자가 직접 고르면 그대로 둠)
-  function autoCycle(rentInp, cycleSel, hint) {
-    var touched = false;
-    cycleSel.addEventListener('change', function () { touched = true; hint.textContent = ''; relabel(); });
-    function relabel() { var l = rentInp.parentNode && rentInp.parentNode.firstChild; if (l && l.nodeType === 3) l.textContent = cycleSel.value === '2w' ? '2주 요금 (만원)' : '월세 (만원)'; }
-    rentInp.addEventListener('input', function () {
-      if (touched) return;
-      var v = Number(rentInp.value);
-      if (v > 0) { cycleSel.value = v <= TWO_WEEK_MAX ? '2w' : 'month'; hint.textContent = v <= TWO_WEEK_MAX ? '22만원 이하라 2주 단위로 골랐습니다. 아니면 바꿔 주세요.' : ''; relabel(); }
-    });
-  }
   function manIn(won) { return won == null ? '' : String(Math.round(won / 1000) / 10); }
   var WD = ['일', '월', '화', '수', '목', '금', '토'];
   function md(s) {
@@ -276,17 +264,14 @@
     var paidBox = check('paidCurrent', '이번 회차 월세는 이미 받음', false);
     paidBox.hidden = true;
     modeSel.addEventListener('change', function () { paidBox.hidden = modeSel.value !== 'living'; });
-    var rentInp = inp('number', 'rent', '', { inputmode: 'decimal', step: 'any', min: 0 });
-    var cycleSel = sel('cycle', [['month', '월 단위 (매달 같은 날)'], ['2w', '2주 단위 (14일마다)']], 'month');
-    var hint = h('p', { class: 'note' });
-    autoCycle(rentInp, cycleSel, hint);
     var f = submitForm([
       field('등록 방식', modeSel),
-      h('div', { class: 'row' }, field('입실일', inp('date', 'move_in', TODAY)), field('월세 (만원)', rentInp)),
-      field('계약 단위', cycleSel), hint,
+      h('div', { class: 'row' }, field('입실일', inp('date', 'move_in', TODAY)), field('금액 (만원)', inp('number', 'rent', '', { inputmode: 'decimal', step: 'any', min: 0 }), '월세 또는 2주 요금')),
+      check('two_week', '2주 단위 계약 (14일마다 납부)', false),
       paidBox
     ].concat(tenantInputs(null, room)), '등록', function (d) {
       d.room_id = room.id;
+      d.cycle = d.two_week ? '2w' : 'month';
       return api('tenant/create', d).then(function (r) { if (r.ok) { close(); toast(room.no + '호 등록했습니다'); location.hash = '#/t/' + r.id; } return r; });
     });
     close = sheet(room.no + '호 입실 등록', f);
@@ -394,10 +379,11 @@
     api('rooms').then(function (rr) {
       var rooms = (rr.rooms || []).filter(function (x) { return x.id === room.id || x.state === 'vacant'; }).map(function (x) { return [x.id, x.no + '호' + (x.id === room.id ? ' (지금)' : '')]; });
       var children = [field('호실', sel('room_id', rooms, room.id), '방 이동은 비어 있는 호실로만'), field('입실일', inp('date', 'move_in', t.move_in), t.status === 'reserved' ? '' : '입금 기록이 있으면 바꿀 수 없습니다')];
-      if (t.status === 'reserved') children.push(h('div', { class: 'row' }, field('계약 단위', sel('cycle', [['month', '월 단위'], ['2w', '2주 단위']], t.cycle || 'month')), field('금액 (만원)', inp('number', 'rent', manIn(t.rent), { inputmode: 'decimal', step: 'any' }))));
+      if (t.status === 'reserved') { children.push(field('금액 (만원)', inp('number', 'rent', manIn(t.rent), { inputmode: 'decimal', step: 'any' }))); children.push(check('two_week', '2주 단위 계약 (14일마다 납부)', t.cycle === '2w')); }
       children = children.concat(tenantInputs(t, room));
       close = sheet(room.no + '호 ' + t.name + ' 정보 수정', submitForm(children, '저장', function (d) {
         d.id = t.id;
+        if (t.status === 'reserved') d.cycle = d.two_week ? '2w' : 'month';
         return api('tenant/update', d).then(function (r) { if (r.ok) { close(); toast('저장했습니다'); reload(); } return r; });
       }));
     });
@@ -411,12 +397,11 @@
   }
   function cycleSheet(t, l) {
     var rentInp = inp('number', 'rent', manIn(t.rent), { inputmode: 'decimal', step: 'any' });
-    var cycleSel = sel('cycle', [['month', '월 단위 (매달 같은 날)'], ['2w', '2주 단위 (14일마다)']], t.cycle === '2w' ? 'month' : '2w');
     var close = sheet(t.name + ' 계약 단위 변경', submitForm([
       h('p', { class: 'note', text: '지금: ' + (t.cycle === '2w' ? '2주 단위 ' : '월 단위 ') + man(t.rent) + '. 적용 시작일이 새 주기의 첫 납부일이 되고, 그 뒤로 매달 같은 날(또는 14일마다) 납부합니다. 지난 장부는 그대로 남습니다.' }),
-      field('바꿀 계약 단위', cycleSel),
+      check('two_week', '2주 단위 계약 (14일마다 납부)', t.cycle !== '2w'),
       h('div', { class: 'row' }, field('새 금액 (만원)', rentInp), field('적용 시작일 (첫 납부일)', inp('date', 'eff_date', (l && l.nextDue) || TODAY)))
-    ], '변경', function (d) { d.id = t.id; return api('tenant/cycle', d).then(function (r) { if (r.ok) { close(); toast('계약 단위를 바꿨습니다'); reload(); } return r; }); }));
+    ], '변경', function (d) { d.id = t.id; d.cycle = d.two_week ? '2w' : 'month'; return api('tenant/cycle', d).then(function (r) { if (r.ok) { close(); toast('계약 단위를 바꿨습니다'); reload(); } return r; }); }));
   }
   function leavingSheet(t) {
     var close = sheet(t.name + ' 퇴실예정', submitForm([
@@ -641,14 +626,14 @@
                   var c = ctl[y.no] = {};
                   var cyc = null, pd = null;
                   if (y.occupied && !y.issues.length) {
-                    cyc = c.cycle = h('select', { style: 'min-height:34px;padding:2px 4px;font-size:13px' }, h('option', { value: 'month', text: '월', selected: y.cycle === 'month' ? true : null }), h('option', { value: '2w', text: '2주', selected: y.cycle === '2w' ? true : null }));
+                    cyc = h('label', { class: 'c', style: 'font-size:13px;font-weight:500' }, c.two = h('input', { type: 'checkbox' }), '2주');
                     if (y.living) pd = h('label', { class: 'c', style: 'font-size:13px;font-weight:500' }, c.paid = h('input', { type: 'checkbox', checked: y.paidDefault }), md(y.paidFor) + '분 받음');
                   }
                   return h('tr', null, h('td', { text: y.no }), h('td', null, y.state, h('br'), h('small', { text: y.name || '' })), h('td', { text: y.rent != null && y.occupied ? y.rent : '' }),
                     h('td', null, cyc), h('td', { class: y.issues.length ? 'err' : '' }, y.issues.length ? y.issues.join(', ') : pd || (y.state === '입실예정' ? '입실 확인 후 시작' : '')));
                 })));
-              add(prev, h('p', { class: 'note', text: '"받음" 기본값: 최근 납부일이 이번 달 1일 전이면 받음(노션은 매월 초 해제), 이번 달이면 노션 입금 체크대로. 금액 22만원 이하는 2주로 골라 두었습니다. 틀린 것만 고친 뒤 가져오세요.' }));
-              var choices = function () { var o = {}; Object.keys(ctl).forEach(function (k) { var c = ctl[k]; if (c.cycle || c.paid) o[k] = { cycle: c.cycle ? c.cycle.value : undefined, paid: c.paid ? c.paid.checked : undefined }; }); return o; };
+              add(prev, h('p', { class: 'note', text: '"받음" 기본값: 최근 납부일이 이번 달 1일 전이면 받음(노션은 매월 초 해제), 이번 달이면 노션 입금 체크대로. 2주 계약인 사람만 "2주"에 체크하세요. 틀린 것만 고친 뒤 가져오세요.' }));
+              var choices = function () { var o = {}; Object.keys(ctl).forEach(function (k) { var c = ctl[k]; if (c.two || c.paid) o[k] = { cycle: c.two ? (c.two.checked ? '2w' : 'month') : undefined, paid: c.paid ? c.paid.checked : undefined }; }); return o; };
               add(prev, bad.length ? h('div', { class: 'warn', text: '빨간 줄을 노션에서 먼저 고친 뒤 다시 미리보기 해 주세요' })
                 : h('button', { class: 'btn full', style: 'margin-top:8px', type: 'button', text: '2. ' + x.rows.length + '줄 가져오기', onclick: function () {
                   if (!confirm('노션 입실자 현황을 가져옵니다 (처음 한 번만). 계속할까요?')) return;

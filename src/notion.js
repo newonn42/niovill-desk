@@ -5,7 +5,6 @@
 import { getSetting, setSetting, audit } from './db.js';
 import { kstToday, parseYmd, cycleIndex, dueByCycle } from './dates.js';
 
-export const TWO_WEEK_MAX = 220000; // 이 금액 이하면 2주 계약으로 먼저 골라 둠 (화면에서 바꿀 수 있음)
 import { ensureCharges, chargesOf, statusOf } from './ledger.js';
 
 const VER = '2022-06-28';
@@ -69,8 +68,8 @@ export async function importPreview(env, today = kstToday()) {
       if (!(r.rent > 0)) issues.push('월세 없음');
       if (r.state !== '입실예정' && parseYmd(r.move_in) && r.move_in > today) issues.push('입실일이 미래인데 상태가 ' + r.state);
     }
-    // 계약 단위: 22만원 이하면 2주로 먼저 골라 둠
-    const cycle = r.rent > 0 && r.rent * 10000 <= TWO_WEEK_MAX ? '2w' : 'month';
+    // 계약 단위: 기본 월 단위 (2주 계약은 미리보기에서 체크)
+    const cycle = 'month';
     // 가장 최근 납부일(오늘 이전) 몫을 받았는지: 노션 '입금'은 매월 초 전체 해제 →
     // 그 납부일이 이번 달 1일 전이면 받은 것으로, 이번 달이면 노션 체크대로 (화면에서 줄마다 바꿀 수 있음)
     const living = !!(occupied && r.state !== '입실예정' && parseYmd(r.move_in) && r.move_in <= today);
