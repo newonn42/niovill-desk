@@ -1,6 +1,6 @@
 # 고시원 관리 프로그램 (niovill-desk)
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/OWNER/REPO)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/newonn42/niovill-desk)
 
 니오빌 홈페이지와 **별개의** 관리 전용 사이트입니다. 검색에 노출되지 않고(noindex, robots 차단), 첫 화면부터 로그인해야 합니다. 비용 0원 (Cloudflare 무료).
 
