@@ -615,7 +615,8 @@
                   api('notion/import', {}).then(function (z) { z.ok ? (toast('호실 ' + z.result.rooms + ' · 입실자 ' + z.result.tenants + '명 가져옴'), paint()) : alert(z.error); });
                 } }));
             });
-          } }), prev);
+          } }));
+          add(box, prev);
         }
         add(box, h('div', { class: 'row' }, r.outDb ? null : act('notion/outdb', '퇴실 기록 DB 만들기'), act('notion/sync', '지금 동기화'), act('notion/resync', '전체 다시 보내기', '노션의 모든 줄을 사이트 내용으로 다시 덮어씁니다')));
       });
