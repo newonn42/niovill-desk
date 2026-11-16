@@ -60,11 +60,36 @@ let ready = false;
 export async function ensureSchema(db) {
   if (ready || !db) return;
   await db.batch(SCHEMA.map((s) => db.prepare(s)));
+  const colsOf = {};
+  const alters = [];
   for (const [t, c, def] of ADD_COLUMNS) {
-    const cols = ((await db.prepare('PRAGMA table_info(' + t + ')').all()).results || []).map((x) => x.name);
-    if (!cols.includes(c)) await db.prepare('ALTER TABLE ' + t + ' ADD COLUMN ' + c + ' ' + def).run();
+    if (!colsOf[t]) colsOf[t] = ((await db.prepare('PRAGMA table_info(' + t + ')').all()).results || []).map((x) => x.name);
+    if (!colsOf[t].includes(c)) alters.push(db.prepare('ALTER TABLE ' + t + ' ADD COLUMN ' + c + ' ' + def));
   }
+  if (alters.length) await db.batch(alters);
   ready = true;
+}
+
+/* D1 무료 요금제는 요청 1번에 쿼리 50번까지 (batch는 1번으로 셈).
+   env.DB를 감싸서 횟수를 셈: db.count, db.left() */
+export const QUERY_LIMIT = 50;
+export function countingDb(real, strict = false) {
+  const w = { count: 0, real };
+  // 개발 모드에서는 한도를 넘으면 실제 서버처럼 오류를 냄
+  const tick = () => { w.count++; if (strict && w.count > QUERY_LIMIT) throw new Error('D1 쿼리 한도 초과 (' + w.count + '번)'); };
+  const wrapStmt = (s) => ({
+    _s: s,
+    bind: (...a) => wrapStmt(s.bind(...a)),
+    first: (...a) => { tick(); return s.first(...a); },
+    all: () => { tick(); return s.all(); },
+    run: () => { tick(); return s.run(); },
+    raw: (...a) => { tick(); return s.raw(...a); }
+  });
+  w.prepare = (sql) => wrapStmt(real.prepare(sql));
+  w.batch = (list) => { tick(); return real.batch(list.map((x) => (x && x._s) || x)); };
+  w.exec = (sql) => { tick(); return real.exec(sql); };
+  w.left = () => QUERY_LIMIT - w.count;
+  return w;
 }
 export async function getSetting(db, key, fallback = null) {
   const r = await db.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first();

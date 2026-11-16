@@ -7,10 +7,9 @@ const ACTIVE = "('in', 'leaving')";
 
 /* 납부 예정분 만들기: 입실·퇴실예정인 사람만, 오늘+10일 안에 오는 납부일까지.
    퇴실예정일이 정해져 있으면 그 날짜 이후 납부일은 만들지 않음 */
-export async function ensureCharges(db, t, today) {
-  if (t.status !== 'in' && t.status !== 'leaving') return 0;
-  const last = await db.prepare('SELECT MAX(k) AS k FROM charges WHERE tenant_id = ?').bind(t.id).first();
-  let k = Math.max(last && last.k != null ? last.k + 1 : 0, t.ledger_from || 0);
+function newCharges(db, t, lastK, today) {
+  if (t.status !== 'in' && t.status !== 'leaving') return [];
+  let k = Math.max(lastK != null ? lastK + 1 : 0, t.ledger_from || 0);
   const limit = addDays(today, LEAD_DAYS);
   const stmts = [];
   for (let n = 0; n < 36; n++, k++) {
@@ -19,27 +18,50 @@ export async function ensureCharges(db, t, today) {
     if (t.leave_date && due >= t.leave_date) break;
     stmts.push(db.prepare('INSERT OR IGNORE INTO charges (tenant_id, k, due, amount) VALUES (?, ?, ?, ?)').bind(t.id, k, due, t.rent));
   }
+  return stmts;
+}
+export async function ensureCharges(db, t, today) {
+  if (t.status !== 'in' && t.status !== 'leaving') return 0;
+  const last = await db.prepare('SELECT MAX(k) AS k FROM charges WHERE tenant_id = ?').bind(t.id).first();
+  const stmts = newCharges(db, t, last ? last.k : null, today);
   if (stmts.length) { await db.batch(stmts); await reallocate(db, t.id); }
   return stmts.length;
 }
 
 // 하루 한 번(또는 관리자가 화면을 열 때) 전체 입실자 확인
+// D1 무료 한도(요청당 쿼리 50번) 때문에 인원수와 상관없이 쿼리 최대 5번
 export async function ensureAll(db, today) {
-  const { results } = await db.prepare('SELECT * FROM tenants WHERE status IN ' + ACTIVE).all();
-  let n = 0;
-  for (const t of results || []) n += await ensureCharges(db, t, today);
-  return n;
+  const { results } = await db.prepare('SELECT t.*, (SELECT MAX(k) FROM charges c WHERE c.tenant_id = t.id) AS last_k FROM tenants t WHERE t.status IN ' + ACTIVE).all();
+  const stmts = [];
+  const touched = [];
+  for (const t of results || []) {
+    const s = newCharges(db, t, t.last_k, today);
+    if (s.length) { stmts.push(...s); touched.push(t.id); }
+  }
+  if (!stmts.length) return 0;
+  await db.batch(stmts);
+  await reallocateMany(db, touched);
+  return stmts.length;
 }
 
 // 입금 배정 다시 계산 (입금·입금 취소·납부분 추가·퇴실 때)
 export async function reallocate(db, tenantId) {
-  const { results: charges } = await db.prepare('SELECT id, due, amount, void FROM charges WHERE tenant_id = ?').bind(tenantId).all();
-  const { results: pays } = await db.prepare('SELECT id, paid_on, amount FROM payments WHERE tenant_id = ? AND cancelled_at IS NULL').bind(tenantId).all();
-  const { alloc } = allocate(charges || [], pays || []);
-  await db.batch([
-    db.prepare('DELETE FROM allocations WHERE tenant_id = ?').bind(tenantId),
-    ...alloc.map(([p, c, a]) => db.prepare('INSERT INTO allocations (tenant_id, payment_id, charge_id, amount) VALUES (?, ?, ?, ?)').bind(tenantId, p, c, a))
-  ]);
+  return reallocateMany(db, [tenantId]);
+}
+// 여러 명을 한꺼번에 (쿼리 3번)
+export async function reallocateMany(db, ids) {
+  if (!ids.length) return;
+  if (ids.length > 80) { for (let i = 0; i < ids.length; i += 80) await reallocateMany(db, ids.slice(i, i + 80)); return; } // D1 바인딩 100개 한도
+  const q = ids.map(() => '?').join(',');
+  const { results: charges } = await db.prepare('SELECT id, tenant_id, due, amount, void FROM charges WHERE tenant_id IN (' + q + ')').bind(...ids).all();
+  const { results: pays } = await db.prepare('SELECT id, tenant_id, paid_on, amount FROM payments WHERE cancelled_at IS NULL AND tenant_id IN (' + q + ')').bind(...ids).all();
+  const stmts = [];
+  for (const id of ids) {
+    const { alloc } = allocate((charges || []).filter((c) => c.tenant_id === id), (pays || []).filter((p) => p.tenant_id === id));
+    stmts.push(db.prepare('DELETE FROM allocations WHERE tenant_id = ?').bind(id));
+    for (const [p, c, a] of alloc) stmts.push(db.prepare('INSERT INTO allocations (tenant_id, payment_id, charge_id, amount) VALUES (?, ?, ?, ?)').bind(id, p, c, a));
+  }
+  await db.batch(stmts);
 }
 
 // 입실자 장부 (납부분별 받은 금액 포함)

@@ -28,7 +28,10 @@ pv=call('notion/preview',{}); bad=[x for x in pv['rows'] if x['issues']]
 ok('미리보기 19줄 · 문제 줄 1개(309호)', len(pv['rows'])==19 and [b['no'] for b in bad]==['309'], (len(pv['rows']),bad))
 r=call('notion/import',{}); ok('문제 있으면 가져오기 거부', not r['ok'] and '309' in r['error'], r)
 s=json.load(open(S+'/notion_state.json')); s['rows']=[x for x in s['rows'] if x['no']!='309']; json.dump(s,open(S+'/notion_state.json','w'),ensure_ascii=False)
-r=call('notion/import',{}); ok('가져오기: 호실 18 · 입실자 15', r.get('ok') and r['result']['rooms']==18 and r['result']['tenants']==15, r)
+for i in range(6):
+    r=call('notion/import',{})
+    if not r.get('ok') or r['result']['done']: break
+ok('가져오기 (나눠서 끝까지): 호실 18 · 입실자 15', r.get('ok') and r['result']['done'] and r['result']['rooms']==18 and r['result']['tenants']==15, r)
 ok('두 번째 가져오기 거부', not call('notion/import',{})['ok'])
 rooms=call('rooms')['rooms']; by={x['no']:x for x in rooms}
 ok('사무실 · 공실 · 입실예정 · 퇴실예정 상태', by['사무실']['state']=='office' and by['306']['state']=='vacant' and by['305']['state']=='reserved' and by['304']['state']=='leaving', [(k,v['state']) for k,v in by.items()])
@@ -93,11 +96,11 @@ r=call('restore',{'data':bk,'confirm':'복구'}); ok('복구', r.get('ok'), r)
 bk2=json.loads(call('backup',raw=True)); t2={k:len(v) for k,v in bk2['tables'].items()}
 ok('복구 후 백업 시점과 같음 (기록 표 제외)', all(t2[k]==counts[k] for k in counts if k not in ('audit',)) and bk2['tables']['payments']==bk['tables']['payments'], (counts,t2))
 # ── 보관 기간 ──
-call('dev/today',{'date':'2029-12-01'}); urllib.request.urlopen(B+'cdn-cgi/handler/scheduled?cron=0+0+*+*+*').read(); time.sleep(2)
+call('dev/today',{'date':'2029-12-01'}); urllib.request.urlopen(B+'cdn-cgi/handler/scheduled?cron=30+0+*+*+*').read(); time.sleep(2)
 t3=call('tenant?id=%d'%tid)['tenant']; ok('퇴실 3년 뒤 이름·전화·마스터 삭제', t3['name']=='(퇴실자)' and t3['phone']=='' and t3['master']=='' and t3['anon_at'], t3)
 call('notion/backup',{}); bk4=[x for x in lines('notion.log') if x['op']=='backup'][-1]
 ok('3년 지난 퇴실자는 백업 퇴실 표에서 빠짐', not any('서파랑' in r or '(퇴실자)' in r for r in bk4['tables'][1]), bk4['tables'][1][:2])
 nb=call('notion'); ok('3년 지난 백업에 "3년 지남" 표시', any(b['old'] for b in nb['backups']))
-call('dev/today',{'date':'2031-12-01'}); urllib.request.urlopen(B+'cdn-cgi/handler/scheduled?cron=0+0+*+*+*').read(); time.sleep(2)
+call('dev/today',{'date':'2031-12-01'}); urllib.request.urlopen(B+'cdn-cgi/handler/scheduled?cron=30+0+*+*+*').read(); time.sleep(2)
 td=call('tenant?id=%d'%tid); ok('퇴실 5년 뒤 장부 삭제', len(td['charges'])==0 and len(td['payments'])==0, (len(td['charges']),len(td['payments'])))
 print('FAIL',fails) if fails else print('ALL PASS')

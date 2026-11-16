@@ -58,7 +58,8 @@ export async function importPreview(env, today = kstToday()) {
   const dbId = dbIdOf(await getSetting(env.DB, 'notionRoomsDb', ''));
   if (!dbId) throw new Error('설정에 노션 입실자 현황 주소를 먼저 넣어 주세요');
   const rows = await readAll(env, dbId);
-  const plan = rows.filter((r) => r.no).map((r) => {
+  // 상태가 빈 줄(예: '보증금합계' 같은 합계 줄)은 호실이 아니므로 건너뜀
+  const plan = rows.filter((r) => r.no && r.state).map((r) => {
     const issues = [];
     const occupied = ['입실', '퇴실예정', '입실예정'].includes(r.state);
     if (occupied) {
@@ -80,24 +81,40 @@ export async function importPreview(env, today = kstToday()) {
   }).sort((a, b) => (a.no < b.no ? -1 : 1));
   return plan;
 }
+// 가져오기가 끝났는지: 끝까지 가져왔거나, 노션 없이 사이트에서 직접 등록해 쓰는 경우
+export async function importDone(db) {
+  if ((await getSetting(db, 'notionImport', '')) === 'done') return true;
+  const r = await db.prepare('SELECT (SELECT COUNT(*) FROM tenants) AS t, (SELECT COUNT(*) FROM rooms WHERE notion_id IS NOT NULL) AS n').first();
+  return r.t > 0 && r.n === 0;
+}
+/* 가져오기 (여러 번 나눠서): D1 무료 한도(요청당 쿼리 50번) 때문에 한 번에 몇 명씩.
+   이미 입실자가 있는 호실은 건너뜀 → 중간에 멈춰도 다시 누르면 이어서 가져옴.
+   화면은 done이 될 때까지 자동으로 다시 부름 */
 export async function importRun(env, admin, today = kstToday(), choices = {}) {
   const db = env.DB;
-  const any = await db.prepare('SELECT COUNT(*) AS n FROM tenants').first();
-  if (any.n > 0) throw new Error('이미 입실자가 있어 가져올 수 없습니다 (처음 한 번만 가능)');
+  if (await importDone(db)) throw new Error('이미 가져오기를 마쳤습니다');
   const plan = await importPreview(env, today);
-  const bad = plan.filter((p) => p.occupied && p.issues.length);
+  const { results: busyRows } = await db.prepare("SELECT r.no FROM tenants t JOIN rooms r ON r.id = t.room_id WHERE t.status IN ('reserved', 'in', 'leaving')").all();
+  const busy = new Set((busyRows || []).map((x) => x.no));
+  const todo = plan.filter((p) => p.occupied && !busy.has(p.no));
+  const bad = todo.filter((p) => p.issues.length);
   if (bad.length) throw new Error('먼저 노션에서 고쳐 주세요: ' + bad.map((b) => b.no + '호(' + b.issues.join(', ') + ')').join(' / '));
-  let rooms = 0, tenants = 0, sort = 0;
-  for (const p of plan) {
+  // 호실은 한꺼번에 (있으면 정보만 갱신)
+  let sort = 0;
+  await db.batch(plan.map((p) => {
     const r = p._r;
     sort += 10;
     const kind = r.state === '사무실' ? 'office' : 'room';
     const type = ['넓은 외창', '넓은 내창', '외창', '내창'].includes(r.type) ? r.type : '';
-    let room = await db.prepare('SELECT id FROM rooms WHERE no = ?').bind(r.no).first();
-    if (room) await db.prepare('UPDATE rooms SET type = ?, kind = ?, notion_id = ?, sort = ? WHERE id = ?').bind(type, kind, r.notion_id, sort, room.id).run();
-    else { const x = await db.prepare('INSERT INTO rooms (no, type, kind, sort, notion_id) VALUES (?, ?, ?, ?, ?)').bind(r.no, type, kind, sort, r.notion_id).run(); room = { id: x.meta.last_row_id }; }
-    rooms++;
-    if (!p.occupied) continue;
+    return db.prepare('INSERT INTO rooms (no, type, kind, sort, notion_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT(no) DO UPDATE SET type = excluded.type, kind = excluded.kind, sort = excluded.sort, notion_id = excluded.notion_id').bind(r.no, type, kind, sort, r.notion_id);
+  }));
+  const { results: roomRows } = await db.prepare('SELECT id, no FROM rooms').all();
+  const roomId = {};
+  for (const x of roomRows || []) roomId[x.no] = x.id;
+  let tenants = 0;
+  for (const p of todo) {
+    if (db.left && db.left() < 16) break; // 한 명에 쿼리 최대 9번 + 마무리 여유
+    const r = p._r;
     const living = r.state !== '입실예정';
     const rent = Math.round(r.rent * 10000);
     const ch = choices[r.no] || {};
@@ -105,22 +122,24 @@ export async function importRun(env, admin, today = kstToday(), choices = {}) {
     const paid = typeof ch.paid === 'boolean' ? ch.paid : p.paidDefault;
     const from = living ? Math.max(0, cycleIndex(cycle, r.move_in, today)) : 0;
     const paidFor = living ? dueByCycle(cycle, r.move_in, from) : '';
-    const ins = await db.prepare('INSERT INTO tenants (room_id, name, phone, move_in, rent, deposit, gender, master, cash_receipt, memo, sms_off, status, ledger_from, cycle, anchor, k_base) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)')
-      .bind(room.id, r.name || '', r.phone ? fmtPhone(r.phone) : '', r.move_in, rent, Math.round((r.deposit || 0) * 10000), ['남', '여'].includes(r.gender) ? r.gender : '', r.master, r.cash_receipt ? 1 : 0, r.memo, r.sms_off ? 1 : 0, living ? (r.state === '퇴실예정' ? 'leaving' : 'in') : 'reserved', from, cycle, r.move_in).run();
-    const t = await db.prepare('SELECT * FROM tenants WHERE id = ?').bind(ins.meta.last_row_id).first();
+    const ins = await db.prepare('INSERT INTO tenants (room_id, name, phone, move_in, rent, deposit, gender, master, cash_receipt, memo, sms_off, status, ledger_from, cycle, anchor, k_base, notion_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)')
+      .bind(roomId[r.no], r.name || '', r.phone ? fmtPhone(r.phone) : '', r.move_in, rent, Math.round((r.deposit || 0) * 10000), ['남', '여'].includes(r.gender) ? r.gender : '', r.master, r.cash_receipt ? 1 : 0, r.memo, r.sms_off ? 1 : 0, living ? (r.state === '퇴실예정' ? 'leaving' : 'in') : 'reserved', from, cycle, r.move_in, r.notion_id).run();
+    const tid = ins.meta.last_row_id;
     tenants++;
     if (living) {
+      // 이번 회차(가장 최근 납부일) 받음 → 입금 먼저 넣고 납부분 만들기 (배정은 그때 한 번)
+      if (paid) await db.prepare("INSERT INTO payments (tenant_id, paid_on, amount, method, memo, by_name) VALUES (?, ?, ?, '기존', ?, ?)").bind(tid, paidFor, rent, '노션에서 가져옴: ' + paidFor + '분 받음', admin.name).run();
+      const t = await db.prepare('SELECT * FROM tenants WHERE id = ?').bind(tid).first();
       await ensureCharges(db, t, today);
-      // 이번 회차(가장 최근 납부일) 받음
-      if (paid) {
-        await db.prepare("INSERT INTO payments (tenant_id, paid_on, amount, method, memo, by_name) VALUES (?, ?, ?, '기존', ?, ?)").bind(t.id, paidFor, rent, '노션에서 가져옴: ' + paidFor + '분 받음', admin.name).run();
-        const { reallocate } = await import('./ledger.js');
-        await reallocate(db, t.id);
-      }
     }
-    await audit(db, admin, '노션에서 가져옴', r.no + '호 ' + (r.name || '(이름 미정)') + ' · ' + r.state + ' · ' + (cycle === '2w' ? '2주' : '월') + (living ? ' · ' + paidFor + '분 ' + (paid ? '받음' : '미입금') : ''), { tenant: t.id, room: room.id });
+    await audit(db, admin, '노션에서 가져옴', r.no + '호 ' + (r.name || '(이름 미정)') + ' · ' + r.state + ' · ' + (cycle === '2w' ? '2주' : '월') + (living ? ' · ' + paidFor + '분 ' + (paid ? '받음' : '미입금') : ''), { tenant: tid, room: roomId[r.no] });
   }
-  return { rooms, tenants, notionRows: plan.length };
+  const remaining = todo.length - tenants;
+  if (!remaining) {
+    await setSetting(db, 'notionImport', 'done', admin.name);
+    await audit(db, admin, '노션에서 처음 가져오기 끝', '호실 ' + plan.length + ' · 입실자 ' + (busy.size + tenants));
+  }
+  return { done: !remaining, rooms: plan.length, tenants: busy.size + tenants, added: tenants, remaining, notionRows: plan.length };
 }
 
 /* ── 백업 ── */

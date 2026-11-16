@@ -5,7 +5,7 @@ import { kstToday, parseYmd, cycleOnOrBefore, dueDate, addDays, tenantDue, tenan
 import { ensureCharges, ensureAll, reallocate, chargesOf, creditOf, statusOf } from './ledger.js';
 import { smsSettings, planSms, runSms, KINDS, DEFAULT_TEMPLATES, TEMPLATE_NAMES, URL_RE, render, bytes, typeOf, PRICE, mdw } from './sms.js';
 import { sendOne, balance, solapiReady } from './sender.js';
-import { importPreview, importRun, backupToNotion, deleteBackup, notionReady, dbIdOf, BACKUP_KEEP_YEARS } from './notion.js';
+import { importPreview, importRun, importDone, backupToNotion, deleteBackup, notionReady, dbIdOf, BACKUP_KEEP_YEARS } from './notion.js';
 import { backupJson, restoreJson, exportCsv } from './data.js';
 
 
@@ -782,7 +782,7 @@ async function notionGet(env) {
   const limit = addDays(today, -Math.round(365.25 * BACKUP_KEEP_YEARS));
   const backups = (await getSetting(db, 'notionBackups', [])).map((b) => Object.assign({}, b, { old: b.day < limit }));
   return json({ ok: true, token: notionReady(env), roomsDb: await getSetting(db, 'notionRoomsDb', ''), backupParent: await getSetting(db, 'notionBackupParent', ''), backups,
-    imported: (await db.prepare('SELECT COUNT(*) AS n FROM tenants').first()).n > 0 });
+    imported: await importDone(db) });
 }
 async function notionSettings(env, admin, b) {
   const id = dbIdOf(b.roomsDb);
@@ -799,10 +799,13 @@ async function notionSettings(env, admin, b) {
 async function notionAct(env, admin, path, b = {}) {
   if (!notionReady(env)) bad('노션 토큰(NOTION_TOKEN)이 설정되지 않았습니다');
   try {
-    if (path === 'notion/preview') return json({ ok: true, rows: (await importPreview(env, await todayOf(env))).map((r) => ({ no: r.no, state: r.state, name: r.name, phone: r.phone, move_in: r.move_in, rent: r.rent, deposit: r.deposit, paid: r.paid, paidFor: r.paidFor, paidDefault: r.paidDefault, cycle: r.cycle, sms_off: r.sms_off, issues: r.issues, occupied: r.occupied, living: r.living })) });
+    if (path === 'notion/preview') {
+      const { results: busyRows } = await env.DB.prepare("SELECT r.no FROM tenants t JOIN rooms r ON r.id = t.room_id WHERE t.status IN ('reserved', 'in', 'leaving')").all();
+      const busy = new Set((busyRows || []).map((x) => x.no));
+      return json({ ok: true, rows: (await importPreview(env, await todayOf(env))).map((r) => busy.has(r.no) && r.occupied ? { no: r.no, state: r.state, name: r.name, issues: [], occupied: false, already: true } : ({ no: r.no, state: r.state, name: r.name, phone: r.phone, move_in: r.move_in, rent: r.rent, deposit: r.deposit, paid: r.paid, paidFor: r.paidFor, paidDefault: r.paidDefault, cycle: r.cycle, sms_off: r.sms_off, issues: r.issues, occupied: r.occupied, living: r.living })) });
+    }
     if (path === 'notion/import') {
       const r = await importRun(env, admin, await todayOf(env), b.choices || {});
-      await audit(env.DB, admin, '노션에서 처음 가져오기', '호실 ' + r.rooms + ' · 입실자 ' + r.tenants);
       return json({ ok: true, result: r });
     }
     if (path === 'notion/backup') {

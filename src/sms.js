@@ -148,30 +148,38 @@ export async function runSms(env, { trigger = 'manual', today = kstToday(), admi
     return finish({ mode: 'deferred', planned: items.length, sent: 0, failed: 0, blocked });
   }
   const runId = await record('live', 0, 0, '');
-  let sent = 0, failed = 0, n = 0;
-  for (const it of ready) {
-    if (++n > MAX_SENDS) break; // 남은 건 다음 실행 때 (무료 요금제 외부 요청 한도)
-    // 보내기 전에 먼저 기록 (중복 방지). 실패분 재시도는 같은 줄을 다시 씀
-    let id = it.retryOf;
-    if (!id) {
-      const ins = await db.prepare("INSERT OR IGNORE INTO sms_log (tenant_id, charge_id, kind, slot, to_phone, text, status, run_id) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)")
-        .bind(it.tenant_id, it.charge_id, it.kind, it.slot, it.to, it.text, runId).run();
-      if (!ins.meta || ins.meta.changes !== 1) continue; // 다른 실행이 이미 기록함
-      id = ins.meta.last_row_id;
-    }
-    const lock = await db.prepare("UPDATE sms_log SET status = 'sending', tries = tries + 1, to_phone = ?, text = ?, run_id = ?, updated_at = datetime('now') WHERE id = ? AND status IN ('pending', 'failed')")
-      .bind(it.to, it.text, runId, id).run();
-    if (!lock.meta || lock.meta.changes !== 1) continue;
+  let sent = 0, failed = 0;
+  // D1 무료 한도(요청당 쿼리 50번) 때문에 기록은 한꺼번에(batch) 처리
+  // 1) 보내기 전에 먼저 기록 (중복 방지 고유키). 실패분 재시도는 같은 줄을 다시 씀
+  const todo = ready.slice(0, MAX_SENDS); // 남은 건 다음 실행 때 (무료 요금제 외부 요청 한도)
+  const fresh = todo.filter((it) => !it.retryOf);
+  if (fresh.length) await db.batch(fresh.map((it) => db.prepare("INSERT OR IGNORE INTO sms_log (tenant_id, charge_id, kind, slot, to_phone, text, status, run_id) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)").bind(it.tenant_id, it.charge_id, it.kind, it.slot, it.to, it.text, runId)));
+  // 2) 이번 실행이 잡은 줄만 'sending'으로 잠금 (다른 실행이 먼저 잡은 줄은 건너뜀)
+  const retryIds = todo.filter((it) => it.retryOf).map((it) => it.retryOf);
+  const lockStmts = [db.prepare("UPDATE sms_log SET status = 'sending', tries = tries + 1, run_id = ?, updated_at = datetime('now') WHERE run_id = ? AND status = 'pending'").bind(runId, runId)];
+  if (retryIds.length) lockStmts.push(db.prepare("UPDATE sms_log SET status = 'sending', tries = tries + 1, run_id = ?, updated_at = datetime('now') WHERE status = 'failed' AND id IN (" + retryIds.map(() => '?').join(',') + ')').bind(runId, ...retryIds));
+  await db.batch(lockStmts);
+  const { results: mine } = await db.prepare("SELECT id, tenant_id, charge_id, kind, slot FROM sms_log WHERE run_id = ? AND status = 'sending'").bind(runId).all();
+  const idOf = {};
+  for (const m of mine || []) idOf[m.tenant_id + ':' + m.charge_id + ':' + m.kind + ':' + m.slot] = m.id;
+  // 3) 보내고, 결과는 10건마다 한꺼번에 기록 (중간에 멈추면 남은 줄은 'sending' = 결과 확인 필요, 다시 보내지 않음)
+  let pending = [];
+  const flush = async () => { if (pending.length) { await db.batch(pending); pending = []; } };
+  for (const it of todo) {
+    const id = idOf[it.tenant_id + ':' + it.charge_id + ':' + it.kind + ':' + it.slot];
+    if (!id) continue;
     const r = await sendOne(env, cfg, it.to, it.text);
     if (r.ok) {
       sent++;
-      await db.prepare("UPDATE sms_log SET status = 'sent', msg_type = ?, cost = ?, msg_id = ?, group_id = ?, err = NULL, updated_at = datetime('now') WHERE id = ?").bind(r.type || it.type, PRICE[r.type || it.type] || PRICE[it.type], r.msgId || null, r.groupId || null, id).run();
+      pending.push(db.prepare("UPDATE sms_log SET status = 'sent', to_phone = ?, text = ?, msg_type = ?, cost = ?, msg_id = ?, group_id = ?, err = NULL, updated_at = datetime('now') WHERE id = ?").bind(it.to, it.text, r.type || it.type, PRICE[r.type || it.type] || PRICE[it.type], r.msgId || null, r.groupId || null, id));
     } else {
       failed++;
       // 응답이 불확실하면 다시 보내지 않음 → '결과 확인 필요'
-      await db.prepare("UPDATE sms_log SET status = ?, err = ?, msg_id = ?, group_id = ?, updated_at = datetime('now') WHERE id = ?").bind(r.unknown ? 'unknown' : 'failed', String(r.error || '실패').slice(0, 200), r.msgId || null, r.groupId || null, id).run();
+      pending.push(db.prepare("UPDATE sms_log SET status = ?, to_phone = ?, text = ?, err = ?, msg_id = ?, group_id = ?, updated_at = datetime('now') WHERE id = ?").bind(r.unknown ? 'unknown' : 'failed', it.to, it.text, String(r.error || '실패').slice(0, 200), r.msgId || null, r.groupId || null, id));
     }
+    if (pending.length >= 10) await flush();
   }
+  await flush();
   // 이제 대상이 아닌 실패분(입금함·퇴실예정 등)은 취소
   await cancelStale(db, items, runId);
   await db.prepare('UPDATE runs SET sent = ?, failed = ? WHERE id = ?').bind(sent, failed, runId).run();
@@ -205,10 +213,8 @@ async function sendSummary(env, cfg, today, res, items, lateD10) {
 async function cancelStale(db, items, runId) {
   const keep = new Set(items.filter((i) => i.retryOf).map((i) => i.retryOf));
   // 이번 실행에서 막 실패한 것은 다음 실행 때 재시도해야 하므로 제외
-  const { results } = await db.prepare("SELECT id FROM sms_log WHERE status = 'failed' AND run_id != ?").bind(runId).all();
-  for (const r of results || []) if (!keep.has(r.id)) {
-    const row = await db.prepare('SELECT tries FROM sms_log WHERE id = ?').bind(r.id).first();
-    // 재시도 횟수를 다 쓴 실패는 그대로 두어 관리자 화면에 보이게 함
-    if (row && row.tries < 2) await db.prepare("UPDATE sms_log SET status = 'cancelled', err = COALESCE(err, '') || ' (대상 아님: 취소)', updated_at = datetime('now') WHERE id = ?").bind(r.id).run();
-  }
+  // 재시도 횟수를 다 쓴 실패(tries 2)는 그대로 두어 관리자 화면에 보이게 함
+  const { results } = await db.prepare("SELECT id FROM sms_log WHERE status = 'failed' AND run_id != ? AND tries < 2").bind(runId).all();
+  const ids = (results || []).map((r) => r.id).filter((id) => !keep.has(id));
+  if (ids.length) await db.batch(ids.map((id) => db.prepare("UPDATE sms_log SET status = 'cancelled', err = COALESCE(err, '') || ' (대상 아님: 취소)', updated_at = datetime('now') WHERE id = ?").bind(id)));
 }

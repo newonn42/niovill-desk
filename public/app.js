@@ -628,7 +628,7 @@
         }));
         if (!r.imported) {
           var prev = h('div');
-          add(box, h('div', { class: 'warn', text: '처음 한 번: 노션 입실자 현황을 이 사이트로 가져옵니다. 가져온 뒤부터는 이 사이트에서만 고치고, 노션 입실자 현황은 보관용으로 남습니다(자동 동기화 없음).' }));
+          add(box, h('div', { class: 'warn', text: '처음 한 번: 노션 입실자 현황을 이 사이트로 가져옵니다. 중간에 멈췄으면 다시 누르면 이어서 가져옵니다(이미 있는 호실은 건너뜀). 가져온 뒤부터는 이 사이트에서만 고치고, 노션 입실자 현황은 보관용으로 남습니다(자동 동기화 없음).' }));
           add(box, h('button', { class: 'btn sm', type: 'button', text: '1. 가져올 내용 미리보기', onclick: function () {
             prev.textContent = '불러오는 중…';
             api('notion/preview', {}).then(function (x) {
@@ -645,15 +645,25 @@
                     if (y.living) pd = h('label', { class: 'c', style: 'font-size:13px;font-weight:500' }, c.paid = h('input', { type: 'checkbox', checked: y.paidDefault }), md(y.paidFor) + '분 받음');
                   }
                   return h('tr', null, h('td', { text: y.no }), h('td', null, y.state, h('br'), h('small', { text: y.name || '' })), h('td', { text: y.rent != null && y.occupied ? y.rent : '' }),
-                    h('td', null, cyc), h('td', { class: y.issues.length ? 'err' : '' }, y.issues.length ? y.issues.join(', ') : pd || (y.state === '입실예정' ? '입실 확인 후 시작' : '')));
+                    h('td', null, cyc), h('td', { class: y.issues.length ? 'err' : '' }, y.already ? '✅ 이미 가져옴' : y.issues.length ? y.issues.join(', ') : pd || (y.state === '입실예정' ? '입실 확인 후 시작' : '')));
                 })));
               add(prev, h('p', { class: 'note', text: '"받음" 기본값: 최근 납부일이 이번 달 1일 전이면 받음(노션은 매월 초 해제), 이번 달이면 노션 입금 체크대로. 2주 계약인 사람만 "2주"에 체크하세요. 틀린 것만 고친 뒤 가져오세요.' }));
               var choices = function () { var o = {}; Object.keys(ctl).forEach(function (k) { var c = ctl[k]; if (c.two || c.paid) o[k] = { cycle: c.two ? (c.two.checked ? '2w' : 'month') : undefined, paid: c.paid ? c.paid.checked : undefined }; }); return o; };
               add(prev, bad.length ? h('div', { class: 'warn', text: '빨간 줄을 노션에서 먼저 고친 뒤 다시 미리보기 해 주세요' })
                 : h('button', { class: 'btn full', style: 'margin-top:8px', type: 'button', text: '2. ' + x.rows.length + '줄 가져오기', onclick: function () {
-                  if (!confirm('노션 입실자 현황을 가져옵니다 (처음 한 번만). 계속할까요?')) return;
-                  this.disabled = true;
-                  api('notion/import', { choices: choices() }).then(function (z) { z.ok ? (toast('호실 ' + z.result.rooms + ' · 입실자 ' + z.result.tenants + '명 가져옴'), paint()) : alert(z.error); });
+                  if (!confirm('노션 입실자 현황을 가져옵니다. 이미 입실자가 있는 호실은 건너뜁니다. 계속할까요?')) return;
+                  var btn = this; btn.disabled = true;
+                  var ch = choices(), round = 0;
+                  // 무료 요금제 한도 때문에 몇 명씩 나눠 가져옴 → 끝날 때까지 자동 반복
+                  (function step() {
+                    btn.textContent = '가져오는 중… (' + (++round) + ')';
+                    api('notion/import', { choices: ch }).then(function (z) {
+                      if (!z.ok) { btn.disabled = false; btn.textContent = '다시 가져오기 (이어서)'; return alert(z.error); }
+                      if (!z.result.done && z.result.added > 0 && round < 30) return step();
+                      if (!z.result.done) { btn.disabled = false; btn.textContent = '다시 가져오기 (이어서)'; return alert('일부만 가져왔습니다 (남은 ' + z.result.remaining + '명). 다시 눌러 주세요.'); }
+                      toast('호실 ' + z.result.rooms + ' · 입실자 ' + z.result.tenants + '명 가져옴'); paint();
+                    });
+                  })();
                 } }));
             });
           } }));
