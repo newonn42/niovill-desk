@@ -238,7 +238,7 @@
       if (x.state === 'vacant') card.appendChild(h('div', { class: 'acts' }, h('button', { class: 'btn sm ghost', type: 'button', onclick: function (e) { e.stopPropagation(); registerSheet(x); }, text: '+ 입실 등록' })));
       return card;
     }
-    card.appendChild(h('div', { class: 'who', text: t.name + (t.sms_off ? ' 🔕' : '') }));
+    card.appendChild(h('div', { class: 'who', text: (t.name || '(이름 미정)') + (t.sms_off ? ' 🔕' : '') }));
     if (t.status === 'reserved') {
       card.appendChild(h('div', { class: 'line' }, h('span', { text: '입실 예정일 ' + md(t.move_in) }), t.checkinDue ? h('span', { class: 'pill b', text: '입실 확인 필요' }) : null));
       if (t.checkinDue) card.appendChild(h('div', { class: 'acts' }, h('button', { class: 'btn sm', type: 'button', onclick: function (e) { e.stopPropagation(); checkinSheet(t, x); }, text: '🔑 입실 확인' })));
@@ -336,7 +336,7 @@
       var content = h('div', null,
         h('div', { class: 'sec' },
           h('div', { class: 'card' },
-            h('div', { class: 'row', style: 'align-items:center' }, h('span', { class: 'big', text: room.no + '호 ' + t.name }), h('span', { style: 'flex:0' }, statePill(t.status))),
+            h('div', { class: 'row', style: 'align-items:center' }, h('span', { class: 'big', text: room.no + '호 ' + (t.name || '(이름 미정)') }), h('span', { style: 'flex:0' }, statePill(t.status))),
             l ? h('div', { style: 'margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center' }, ledgerPill(l), h('span', { class: 'note', text: '다음 납부 ' + md(l.nextDue) + (l.code === 'late' ? ' · 미납 ' + man(l.owed) : '') + (r.credit > 0 ? ' · 선입금 ' + man(r.credit) : '') }),
               active ? h('button', { class: 'link', type: 'button', onclick: function () { nextDueSheet(t, l); }, text: '납부일 수정' }) : null) : null,
             t.status === 'leaving' ? h('p', { class: 'note', text: '퇴실예정일 ' + (t.leave_date ? md(t.leave_date) : '미정') + ' · 자동 문자 중단됨' }) : null),
@@ -384,7 +384,7 @@
           h('h2', { text: '변경 이력' }),
           h('ul', { class: 'log card' }, r.log.length ? r.log.map(function (x) { return h('li', null, h('small', { text: kt(x.at) + ' · ' + (x.who || '') + ' ' }), h('b', { text: x.action }), x.detail ? ' · ' + x.detail : ''); }) : h('li', { text: '없음' }))
         ));
-      frame(room.no + '호 ' + t.name, { back: true }, content);
+      frame(room.no + '호 ' + (t.name || '(이름 미정)'), { back: true }, content);
     });
   }
   function editSheet(t, room) {

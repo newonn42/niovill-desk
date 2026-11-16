@@ -181,7 +181,7 @@ async function dash(env) {
   for (const r of rooms) {
     const t = r.tenant;
     if (!t) continue;
-    if (t.checkinDue) todo.push({ kind: 'checkin', room: r.no, id: t.id, text: r.no + '호 ' + t.name + ' 입실 확인 (입실일 ' + t.move_in + ')' });
+    if (t.checkinDue) todo.push({ kind: 'checkin', room: r.no, id: t.id, text: r.no + '호 ' + (t.name || '(이름 미정)') + ' 입실 확인 (입실일 ' + t.move_in + ')' + (!t.name || !t.phone ? ' · 이름·번호 입력 필요' : '') });
     if (t.checkoutDue) todo.push({ kind: 'checkout', room: r.no, id: t.id, text: r.no + '호 ' + t.name + ' 퇴실 처리 (퇴실예정 ' + t.leave_date + ')' });
     if (t.ledger && t.ledger.code === 'late' && t.ledger.days >= 3) todo.push({ kind: 'call', room: r.no, id: t.id, text: r.no + '호 ' + t.name + ' 미납 ' + manText(t.ledger.owed) + ' · D+' + t.ledger.days + ' 전화 확인' });
   }
@@ -229,13 +229,16 @@ async function freeRoom(db, roomId, exceptTenant = 0) {
   if (r.kind === 'office') bad('사무실에는 입실자를 넣을 수 없습니다');
   if (r.repair) bad('수리중인 호실입니다. 설정 → 호실에서 수리중을 먼저 풀어 주세요');
   const busy = await db.prepare("SELECT name FROM tenants WHERE room_id = ? AND status IN ('reserved', 'in', 'leaving') AND id != ?").bind(r.id, exceptTenant).first();
-  if (busy) bad(r.no + '호에는 이미 ' + busy.name + '님이 있습니다');
+  if (busy) bad(r.no + '호에는 이미 ' + (busy.name || '예약자') + '님이 있습니다');
   return r;
 }
-function tenantFields(b) {
+// 입실예정(예약)은 이름·전화번호 없이도 등록 가능 (입실 확인 때 필요)
+function tenantFields(b, reserved = false) {
+  const name = str(b.name, 20);
+  const phoneRaw = String(b.phone || '').trim();
   return {
-    name: str(b.name, 20) || bad('이름을 입력해 주세요'),
-    phone: phoneOf(b.phone),
+    name: name || (reserved ? '' : bad('이름을 입력해 주세요')),
+    phone: !phoneRaw && reserved ? '' : phoneOf(phoneRaw),
     deposit: man(b.deposit, '보증금', { max: 10000 }),
     gender: GENDERS.includes(b.gender) ? b.gender : '',
     master: str(b.master, 20),
@@ -253,7 +256,7 @@ async function tenantCreate(env, admin, b) {
   const db = env.DB;
   const today = await todayOf(env);
   const room = await freeRoom(db, b.room_id);
-  const f = tenantFields(b);
+  const f = tenantFields(b, b.mode !== 'living');
   const moveIn = dateOf(b.move_in, '입실일');
   const rent = man(b.rent, '월세', { min: 1, max: 1000 });
   // 'living' = 이미 살고 있는 분 등록 (기존 입실자 옮겨 오기): 이번 회차부터 장부 시작
@@ -282,7 +285,7 @@ async function tenantUpdate(env, admin, b) {
   const today = await todayOf(env);
   const t = await tenantRow(db, b.id);
   if (t.status === 'out' || t.status === 'cancelled') bad('퇴실한 기록은 고칠 수 없습니다');
-  const f = tenantFields(b);
+  const f = tenantFields(b, t.status === 'reserved');
   const changes = [];
   for (const k of Object.keys(f)) if (String(f[k] ?? '') !== String(t[k] ?? '')) changes.push(k === 'master' ? '마스터' : k);
   let roomId = t.room_id;
@@ -382,6 +385,7 @@ async function checkin(env, admin, b) {
   const today = await todayOf(env);
   const t = await tenantRow(db, b.id);
   if (t.status !== 'reserved') bad('입실예정인 분만 입실 확인할 수 있습니다');
+  if (!t.name || !t.phone) bad('입실 확인 전에 [✏️ 정보 수정]에서 이름과 전화번호를 넣어 주세요');
   const moveIn = dateOf(b.move_in || t.move_in, '입실일');
   if (moveIn > today) bad('입실일이 아직 오지 않았습니다. 실제 입실한 날로 바꿔 주세요');
   await db.prepare("UPDATE tenants SET status = 'in', move_in = ?, anchor = ?, k_base = 0, ledger_from = 0, updated_at = datetime('now') WHERE id = ?").bind(moveIn, moveIn, t.id).run();

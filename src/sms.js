@@ -104,7 +104,7 @@ export async function planSms(db, today, cfg) {
     if (t.status !== 'reserved') continue;
     const off = diffDays(today, t.move_in);
     if (off < 0 || off > 2) continue;
-    const v = { 상호: biz, 호실: t.room, 이름: t.name, 입실일: mdw(t.move_in) };
+    const v = { 상호: biz, 호실: t.room, 이름: t.name || '(이름 미정)', 입실일: mdw(t.move_in) };
     for (const p of cfg.opPhones || []) push({ tenant_id: t.id, charge_id: 0, kind: 'opin', slot: p, room: t.room, name: t.name, to: p, due: t.move_in, text: render(cfg.templates.opin, v), blocked: '' });
   }
   const order = { d10: 1, d7: 2, d1: 3, dp1: 4, op3: 5, opin: 6 };

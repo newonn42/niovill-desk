@@ -62,8 +62,9 @@ export async function importPreview(env, today = kstToday()) {
     const issues = [];
     const occupied = ['입실', '퇴실예정', '입실예정'].includes(r.state);
     if (occupied) {
-      if (!r.name) issues.push('이름 없음');
-      if (!phoneOk(r.phone)) issues.push('전화번호 확인 필요');
+      const rsv = r.state === '입실예정'; // 예약은 이름·번호 없어도 됨 (입실 확인 때 입력)
+      if (!r.name && !rsv) issues.push('이름 없음');
+      if (!(rsv && !r.phone) && !phoneOk(r.phone)) issues.push('전화번호 확인 필요');
       if (!parseYmd(r.move_in)) issues.push('입실일 없음');
       if (!(r.rent > 0)) issues.push('월세 없음');
       if (r.state !== '입실예정' && parseYmd(r.move_in) && r.move_in > today) issues.push('입실일이 미래인데 상태가 ' + r.state);
@@ -105,7 +106,7 @@ export async function importRun(env, admin, today = kstToday(), choices = {}) {
     const from = living ? Math.max(0, cycleIndex(cycle, r.move_in, today)) : 0;
     const paidFor = living ? dueByCycle(cycle, r.move_in, from) : '';
     const ins = await db.prepare('INSERT INTO tenants (room_id, name, phone, move_in, rent, deposit, gender, master, cash_receipt, memo, sms_off, status, ledger_from, cycle, anchor, k_base) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)')
-      .bind(room.id, r.name, fmtPhone(r.phone), r.move_in, rent, Math.round((r.deposit || 0) * 10000), ['남', '여'].includes(r.gender) ? r.gender : '', r.master, r.cash_receipt ? 1 : 0, r.memo, r.sms_off ? 1 : 0, living ? (r.state === '퇴실예정' ? 'leaving' : 'in') : 'reserved', from, cycle, r.move_in).run();
+      .bind(room.id, r.name || '', r.phone ? fmtPhone(r.phone) : '', r.move_in, rent, Math.round((r.deposit || 0) * 10000), ['남', '여'].includes(r.gender) ? r.gender : '', r.master, r.cash_receipt ? 1 : 0, r.memo, r.sms_off ? 1 : 0, living ? (r.state === '퇴실예정' ? 'leaving' : 'in') : 'reserved', from, cycle, r.move_in).run();
     const t = await db.prepare('SELECT * FROM tenants WHERE id = ?').bind(ins.meta.last_row_id).first();
     tenants++;
     if (living) {
@@ -117,7 +118,7 @@ export async function importRun(env, admin, today = kstToday(), choices = {}) {
         await reallocate(db, t.id);
       }
     }
-    await audit(db, admin, '노션에서 가져옴', r.no + '호 ' + r.name + ' · ' + r.state + ' · ' + (cycle === '2w' ? '2주' : '월') + (living ? ' · ' + paidFor + '분 ' + (paid ? '받음' : '미입금') : ''), { tenant: t.id, room: room.id });
+    await audit(db, admin, '노션에서 가져옴', r.no + '호 ' + (r.name || '(이름 미정)') + ' · ' + r.state + ' · ' + (cycle === '2w' ? '2주' : '월') + (living ? ' · ' + paidFor + '분 ' + (paid ? '받음' : '미입금') : ''), { tenant: t.id, room: room.id });
   }
   return { rooms, tenants, notionRows: plan.length };
 }
