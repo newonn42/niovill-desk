@@ -70,7 +70,7 @@ ok('D 실패 → D-10은 1번 재시도 (tries 2)', [r for r in by('디') if r[0
 ok('E 결과 불확실 → 다시 보내지 않음 · 2/18 누락일의 D-7은 안 감', by('이')==[('d10','02-25','unknown',1),('d10','03-25','unknown',1),('d7','03-25','unknown',1)], by('이'))
 ok('F 퇴실예정(2/17) 이후 중단', by('에프')==[('d10','02-22','sent',1),('d7','02-22','sent',1)])
 ok('H 선입금 → 0건', by('에이치')==[])
-ok('운영자: I 입실 확인 1번만 (미납 알림 없음)', [o for o in ops if o[1]!='summary']==[('아이','opin','sent')], ops)
+ok('운영자에게는 요약 문자만 (미납·입실 확인 문자 꺼짐)', [o for o in ops if o[1]!='summary']==[], ops)
 runs=json.loads(subprocess.run(['npx','wrangler','d1','execute','desk-db','--local','--persist-to',os.environ['PERSIST'],'--json','--command',"SELECT day, trigger, mode FROM runs ORDER BY id"],capture_output=True,text=True,cwd='/home/claude/desk').stdout)[0]['results']
 ok('2/20 자동 실행 1번만 (두 번째 건너뜀)', sum(1 for x in runs if x['day']=='2026-02-20' and x['trigger']=='cron')==1)
 ok('3/5 긴급 정지 기록', any(x['day']=='2026-03-05' and x['mode']=='stopped' for x in runs))

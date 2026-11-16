@@ -18,7 +18,9 @@ export const KINDS = {
   opin: { name: '운영자: 입실 확인', operator: true },
   summary: { name: '운영자: 매일 요약', operator: true }
 };
-export const TEMPLATE_NAMES = { d10: 'D-10 납부 예정·퇴실 확인', d7: 'D-7 퇴실 통보 마감 (오늘까지)', opin: '운영자: 입실 확인' };
+// 설정 화면에 보이는 문구 (꺼진 문자는 숨김)
+export const TEMPLATE_NAMES = { d10: 'D-10 납부 예정·퇴실 확인', d7: 'D-7 퇴실 통보 마감 (오늘까지)' };
+export const OPIN_ON = false; // 운영자 입실 확인 문자 (꺼짐, 할 일 목록에는 그대로 표시)
 export const DEFAULT_TEMPLATES = {
   d10: '[{상호}] {이름}님, 다음 입실료 납부일은 {납부일}, 금액은 {금액}입니다.\n퇴실 예정이시면 {퇴실통보일}까지 이 번호로 답장 부탁드립니다. 연락이 없으시면 연장으로 안내드립니다.\n※ 퇴실 7일 전까지 미통보 시 보증금은 반환되지 않습니다.',
   d7: '[{상호}] {이름}님, 오늘({퇴실통보일})이 퇴실 통보 마감일입니다.\n{납부일}에 퇴실하실 예정이면 오늘 중 이 번호로 답장 부탁드립니다. 연락이 없으시면 연장으로 처리됩니다.\n※ 미통보 시 보증금은 반환되지 않습니다.',
@@ -100,7 +102,7 @@ export async function planSms(db, today, cfg) {
     }
   }
   // 입실예정인데 입실일이 지남 → 운영자에게 입실 확인 알림 (3일 안 보완)
-  for (const t of ts || []) {
+  for (const t of OPIN_ON ? ts || [] : []) {
     if (t.status !== 'reserved') continue;
     const off = diffDays(today, t.move_in);
     if (off < 0 || off > 2) continue;

@@ -517,7 +517,7 @@
             if (!confirm(r.cfg.testPhone + '로 시험 문자 1건을 보냅니다')) return;
             api('sms/test', {}).then(function (x) { x.ok ? (toast('시험 문자를 보냈습니다'), reload()) : alert(x.error); });
           }, text: '내 번호로 시험 발송' })),
-        !r.cfg.account ? h('div', { class: 'warn' }, '입금계좌 문구가 비어 있습니다. ', owner ? h('a', { href: '#/settings', text: '설정으로 이동' }) : '최고 관리자에게 요청해 주세요') : null,
+        null,
         r.attention ? h('div', { class: 'warn', text: '결과 확인이 필요한 문자 ' + r.attention + '건 (아래 발송 기록)' }) : null);
       function stopToggle(stop) { api('sms/stop', { stop: stop }).then(function (x) { x.ok ? (toast(stop ? '정지했습니다' : '다시 시작했습니다'), reload()) : alert(x.error); }); }
       var planList = r.plan.length ? h('ul', { class: 'list' }, r.plan.map(function (p) {
@@ -752,7 +752,7 @@
     api('sms/settings').then(function (r) {
       if (!r.ok) return;
       var c = r.cfg;
-      var tplFields = Object.keys(r.defaults).map(function (k) {
+      var tplFields = Object.keys(r.kinds).map(function (k) {
         var ta = h('textarea', { name: 'tpl_' + k, rows: 5 }, c.templates[k]);
         var pv = h('pre', { style: 'white-space:pre-wrap;font:inherit;font-size:12px;margin:0;background:var(--bg);padding:8px;border-radius:8px', hidden: true });
         var btn = h('button', { class: 'link', type: 'button', text: '미리보기', onclick: function () { api('sms/preview', { kind: k, text: ta.value }).then(function (x) { pv.hidden = false; pv.textContent = x.text + '\n\n(' + x.bytes + '바이트 · ' + x.type + ')'; }); } });
@@ -764,16 +764,14 @@
         !r.solapi ? h('p', { class: 'note', text: '솔라피가 연결되기 전에는 테스트 모드만 쓸 수 있습니다.' }) : null,
         field('발신번호', inp('tel', 'senderPhone', c.senderPhone, { placeholder: '솔라피에 등록한 번호' })),
         field('시험 발송 받을 번호', inp('tel', 'testPhone', c.testPhone, { placeholder: '내 휴대폰' })),
-        field('운영자 알림 번호', inp('text', 'opPhones', (c.opPhones || []).join(', '), { placeholder: '여러 개는 쉼표로' }), '입실예정자 입실 확인 알림을 받을 번호'),
         field('매일 요약 문자 받을 번호', inp('tel', 'summaryPhone', c.summaryPhone, { placeholder: '예: 엄경환 휴대폰' }), '매일 9시 "오늘 n건 발송·실패·잔액" (0건인 날도). 비우면 안 보냄'),
         field('솔라피 잔액 경고 기준 (원)', inp('number', 'balanceWarn', c.balanceWarn, { inputmode: 'numeric' })),
-        field('입금계좌 문구', inp('text', 'account', c.account, { placeholder: '예: 국민 123-45-6789 (예금주 엄경환)' }), '지금은 문자에 쓰이지 않음 (나중에 D-1 문자를 켜면 사용)'),
         h('div', { class: 'row' }, field('보내기 시작 (시)', inp('number', 'windowStart', c.windowStart)), field('보내기 끝 (시)', inp('number', 'windowEnd', c.windowEnd))),
-        h('p', { class: 'note', text: '문구는 [상호]로 시작하고 인터넷 주소는 넣지 마세요(스팸 분류). 쓸 수 있는 값: {상호} {호실} {이름} {납부일} {금액} {남은금액} {계좌} {퇴실통보일} {입실일} {월세} {보증금} {경과일}' })
+        h('p', { class: 'note', text: '문구는 [상호]로 시작하고 인터넷 주소는 넣지 마세요(스팸 분류). 쓸 수 있는 값: {상호} {호실} {이름} {납부일} {금액} {퇴실통보일} {입실일} {월세} {보증금}' })
       ].concat(tplFields), '문자 설정 저장', function (d) {
         var tpl = {};
-        Object.keys(r.defaults).forEach(function (k) { tpl[k] = d['tpl_' + k]; });
-        var body = { testMode: d.testMode, senderPhone: d.senderPhone, testPhone: d.testPhone, opPhones: d.opPhones, summaryPhone: d.summaryPhone, balanceWarn: d.balanceWarn, account: d.account, windowStart: d.windowStart, windowEnd: d.windowEnd, templates: tpl };
+        Object.keys(r.kinds).forEach(function (k) { tpl[k] = d['tpl_' + k]; });
+        var body = { testMode: d.testMode, senderPhone: d.senderPhone, testPhone: d.testPhone, summaryPhone: d.summaryPhone, balanceWarn: d.balanceWarn, windowStart: d.windowStart, windowEnd: d.windowEnd, templates: tpl };
         if (c.senderPhone && d.senderPhone.replace(/\D/g, '') !== c.senderPhone.replace(/\D/g, '') && !confirm('발신번호를 바꾸면 입실자의 답장(퇴실 통보 포함)도 새 번호로 갑니다. 새 번호 주인에게 꼭 알려 주세요. 계속할까요?')) return Promise.resolve({ ok: false, error: '취소했습니다' });
         if (c.testMode && !d.testMode && !confirm('⚠️ 실제 발송으로 바꿉니다. 내일 오전 9시부터 입실자에게 문자가 갑니다. 계속할까요?')) return Promise.resolve({ ok: false, error: '취소했습니다' });
         return api('sms/settings', body).then(function (x) { if (x.ok) { toast('저장했습니다'); c.testMode = d.testMode; } return x; });
