@@ -152,7 +152,7 @@
       h('button', { class: 'icon', 'aria-label': '검색', onclick: searchSheet, text: '🔍' }));
     var cur = location.hash.split('/').slice(0, 2).join('/') || '#/';
     var nav = h('nav', { class: 'nav' }, NAV.map(function (n) { return h('a', { href: n[0], class: (cur === n[0] || (n[0] === '#/rooms' && cur === '#/t')) ? 'on' : '' }, h('span', { text: n[1] }), n[2]); }));
-    app.appendChild(h('div', { class: 'wrap' }, top, content));
+    app.appendChild(h('div', { class: 'wrap' + (opts.wide ? ' wide' : '') }, top, content));
     app.appendChild(nav);
   }
   function route() {
@@ -197,35 +197,102 @@
     });
   }
 
-  /* ── 호실 ── */
-  var roomFilter = 'all';
+  /* ── 호실 ── (기본: 표 보기, 카드 보기는 전환 버튼. 방이 많은 고시원용) */
+  var roomFilter = 'all', roomSort = 'no', roomQ = '';
+  var roomMode = (function () { try { return localStorage.getItem('roomMode') || 'table'; } catch (e) { return 'table'; } })();
+  // 숫자 호실이면 층 (601 → 6층, 1203 → 12층), 아니면 묶지 않음
+  function sd(s) { if (!s) return ''; var p = s.split('-'); return Number(p[1]) + '/' + Number(p[2]); } // 11/17
+  function yd(s) { if (!s) return ''; var p = s.split('-'); return (TODAY && TODAY.slice(0, 4) === p[0] ? '' : p[0].slice(2) + '.') + Number(p[1]) + '.' + Number(p[2]); } // 올해면 11.17, 아니면 20.3.15
+  function floorOf(no) { var m = /^(\d{1,2})\d{2}$/.exec(String(no).trim()); return m ? Number(m[1]) : null; }
+  function roomStatus(x) {
+    var t = x.tenant, l = t && t.ledger;
+    if (!t) return x.state === 'vacant' ? h('span', { class: 'pill', text: '공실' }) : statePill(x.state);
+    if (t.status === 'reserved') return h('span', { class: 'pill b', text: t.checkinDue ? '입실 확인 필요' : '입실예정' });
+    var p = ledgerPill(l);
+    if (t.status === 'leaving') return h('span', null, p, ' ', h('span', { class: 'pill a', text: '퇴실 ' + sd(t.leave_date) }));
+    return p;
+  }
   function roomsView() {
-    frame('호실', {}, h('p', { class: 'loading', text: '불러오는 중…' }));
+    frame('호실', { wide: roomMode === 'table' }, h('p', { class: 'loading', text: '불러오는 중…' }));
     api('rooms').then(function (r) {
       if (!r.ok) return;
       TODAY = r.today;
       var filters = [['all', '전체'], ['late', '미납'], ['vacant', '공실'], ['leaving', '퇴실예정'], ['reserved', '입실예정']];
-      var listEl = h('div', { class: 'list' });
+      var listEl = h('div');
+      var lateOf = function (x) { return x.tenant && x.tenant.ledger && x.tenant.ledger.code === 'late'; };
+      var dueOf = function (x) { var t = x.tenant; if (!t) return '9999'; if (t.status === 'reserved') return t.move_in; return (t.ledger && t.ledger.nextDue) || '9999'; };
+      var sorts = {
+        no: function (a, b) { return 0; }, // 서버 순서(설정의 호실 순서)
+        due: function (a, b) { return dueOf(a) < dueOf(b) ? -1 : dueOf(a) > dueOf(b) ? 1 : 0; },
+        late: function (a, b) { var da = lateOf(a) ? a.tenant.ledger.days : -1, db = lateOf(b) ? b.tenant.ledger.days : -1; return db - da; }
+      };
+      function shownRooms() {
+        var q = roomQ.trim().toLowerCase();
+        var list = r.rooms.filter(function (x) {
+          if (roomFilter === 'late' && !lateOf(x)) return false;
+          if (roomFilter !== 'all' && roomFilter !== 'late' && x.state !== roomFilter) return false;
+          if (q && String(x.no).toLowerCase().indexOf(q) < 0 && !(x.tenant && String(x.tenant.name || '').toLowerCase().indexOf(q) >= 0)) return false;
+          return true;
+        });
+        var idx = {}; r.rooms.forEach(function (x, i) { idx[x.id] = i; });
+        return list.sort(function (a, b) { return sorts[roomSort](a, b) || idx[a.id] - idx[b.id]; });
+      }
+      function th(label, key, cls) {
+        if (!key) return h('th', { class: cls || '', text: label });
+        return h('th', { class: (cls || '') + ' sortable' + (roomSort === key ? ' on' : ''), onclick: function () { roomSort = key; paint(); }, text: label + (roomSort === key ? ' ▾' : '') });
+      }
+      function tableOf(list) {
+        var head = h('tr', null, th('호실', 'no'), th('타입', null, 'w'), th('이름'), th('전화', null, 'w'), th('계약', null, 'w'), th('금액', null, 'w num'), th('보증금', null, 'w num'), th('입실일', null, 'w'), th('다음 납부일', 'due'), th('상태', 'late'));
+        var rows = [head], lastFloor;
+        var grouped = roomSort === 'no';
+        list.forEach(function (x) {
+          var f = floorOf(x.no);
+          if (grouped && f != null && f !== lastFloor) { rows.push(h('tr', { class: 'floor' }, h('td', { colspan: 10, text: f + '층' }))); lastFloor = f; }
+          var t = x.tenant;
+          var due = !t ? '' : t.status === 'reserved' ? sd(t.move_in) + ' 입실' : (t.ledger ? sd(t.ledger.nextDue) : '');
+          var tr = h('tr', { class: 'rrow' + (lateOf(x) ? ' late' : '') + (t ? '' : ' empty'), onclick: function () { if (t) location.hash = '#/t/' + t.id; else if (x.state === 'vacant') registerSheet(x); } },
+            h('td', { class: 'no', text: x.no }),
+            h('td', { class: 'w', text: x.type || '' }),
+            h('td', { class: 'nm', text: t ? (t.name || '(이름 미정)') + (t.sms_off ? ' 🔕' : '') : (x.state === 'vacant' ? '+ 입실 등록' : '') }),
+            h('td', { class: 'w', text: t ? t.phone || '' : '' }),
+            h('td', { class: 'w', text: t ? (t.cycle === '2w' ? '2주' : '월') : '' }),
+            h('td', { class: 'w num', text: t ? man(t.rent) : '' }),
+            h('td', { class: 'w num', text: t ? man(t.deposit) : '' }),
+            h('td', { class: 'w', text: t ? yd(t.move_in) : '' }),
+            h('td', { class: 'dd', text: due }),
+            h('td', null, roomStatus(x)));
+          rows.push(tr);
+        });
+        return h('div', { class: 'tblwrap' }, h('table', { class: 'tbl rooms' }, rows));
+      }
       function paint() {
         listEl.textContent = '';
-        var shown = r.rooms.filter(function (x) {
-          if (roomFilter === 'all') return true;
-          if (roomFilter === 'late') return x.tenant && x.tenant.ledger && x.tenant.ledger.code === 'late';
-          return x.state === roomFilter;
-        });
-        if (!shown.length) listEl.appendChild(h('p', { class: 'empty', text: r.rooms.length ? '해당하는 호실이 없습니다' : '호실이 없습니다. 설정 → 호실에서 추가해 주세요' }));
-        shown.forEach(function (x) { listEl.appendChild(roomCard(x)); });
+        var shown = shownRooms();
+        if (!shown.length) return listEl.appendChild(h('p', { class: 'empty', text: r.rooms.length ? '해당하는 호실이 없습니다' : '호실이 없습니다. 설정 → 호실에서 추가해 주세요' }));
+        if (roomMode === 'table') return listEl.appendChild(tableOf(shown));
+        var cards = h('div', { class: 'list' });
+        shown.forEach(function (x) { cards.appendChild(roomCard(x)); });
+        listEl.appendChild(cards);
       }
       var chips = h('div', { class: 'chips' }, filters.map(function (f) {
         return h('button', { type: 'button', class: 'chip' + (roomFilter === f[0] ? ' on' : ''), onclick: function () { roomFilter = f[0]; Array.prototype.forEach.call(chips.children, function (c) { c.classList.remove('on'); }); this.classList.add('on'); paint(); }, text: f[1] });
       }));
-      var lateRooms = r.rooms.filter(function (x) { return x.tenant && x.tenant.ledger && x.tenant.ledger.code === 'late'; });
+      var search = h('input', { type: 'search', class: 'rsearch', placeholder: '호실·이름 찾기', value: roomQ, oninput: function () { roomQ = this.value; paint(); } });
+      var modeBtn = h('button', { type: 'button', class: 'btn sm ghost', text: roomMode === 'table' ? '카드로 보기' : '표로 보기', onclick: function () {
+        roomMode = roomMode === 'table' ? 'card' : 'table';
+        try { localStorage.setItem('roomMode', roomMode); } catch (e) {}
+        roomsView();
+      } });
+      var lateRooms = r.rooms.filter(lateOf);
       var owedSum = lateRooms.reduce(function (a, x) { return a + x.tenant.ledger.owed; }, 0);
       var summary = h('div', { class: 'grid3' },
         h('div', { class: 'stat' + (lateRooms.length ? ' red' : '') }, h('span', { text: '미납' }), h('b', { text: lateRooms.length + '명' }), lateRooms.length ? h('small', { text: man(owedSum) }) : null),
         h('div', { class: 'stat' }, h('span', { text: '퇴실예정' }), h('b', { text: r.rooms.filter(function (x) { return x.state === 'leaving'; }).length + '명' })),
         h('div', { class: 'stat' }, h('span', { text: '공실' }), h('b', { text: r.rooms.filter(function (x) { return x.state === 'vacant'; }).length + '개' })));
-      frame('호실', {}, h('div', { class: 'sec' }, summary, chips, listEl));
+      var sortRow = roomMode === 'card' ? h('div', { class: 'chips' }, [['no', '호실순'], ['due', '납부일 순'], ['late', '미납 오래된 순']].map(function (o) {
+        return h('button', { type: 'button', class: 'chip' + (roomSort === o[0] ? ' on' : ''), onclick: function () { roomSort = o[0]; roomsView(); }, text: o[1] });
+      })) : null;
+      frame('호실', { wide: roomMode === 'table' }, h('div', { class: 'sec' }, summary, h('div', { class: 'rtools' }, search, modeBtn), chips, sortRow, listEl));
       paint();
     });
   }

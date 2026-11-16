@@ -87,3 +87,26 @@ label.c input { width: 20px; height: 20px; }
 .tbl .link { white-space: nowrap; }
 .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .stat small { display: block; font-size: 12px; color: var(--red); font-weight: 700; }
+
+/* 호실 표 보기 */
+.wrap.wide { max-width: 1100px; }
+.rtools { display: flex; gap: 8px; align-items: center; }
+.rsearch { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; font-size: 15px; background: #fff; }
+.tblwrap { background: var(--card); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+.tbl.rooms { font-size: 14px; }
+.tbl.rooms th, .tbl.rooms td { padding: 9px 8px; vertical-align: middle; }
+.tbl.rooms th { background: #FAFBF9; position: sticky; top: 0; white-space: nowrap; }
+.tbl.rooms th.sortable { cursor: pointer; }
+.tbl.rooms th.on { color: var(--ink); }
+.tbl.rooms td.no { font-weight: 800; white-space: nowrap; }
+.tbl.rooms td.nm { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tbl.rooms tr.rrow { cursor: pointer; }
+.tbl.rooms tr.rrow:hover td { background: #F7F8F6; }
+.tbl.rooms tr.late td.no, .tbl.rooms tr.late td.nm { color: var(--red); }
+.tbl.rooms tr.empty td.nm { color: var(--muted); font-size: 13px; }
+.tbl.rooms tr.floor td { background: var(--bg); color: var(--muted); font-size: 12px; font-weight: 800; padding: 5px 8px; }
+.tbl.rooms td .pill { font-size: 11px; }
+.tbl.rooms .w { display: none; }
+@media (min-width: 760px) { .tbl.rooms .w { display: table-cell; } }
+@media (max-width: 380px) { .tbl.rooms th, .tbl.rooms td { padding: 8px 5px; } .tbl.rooms { font-size: 13px; } }
+.tbl.rooms td.dd { white-space: nowrap; }
