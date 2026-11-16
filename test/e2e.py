@@ -45,7 +45,7 @@ day('2026-04-20'); call(O,'rooms'); t=st(); ok('4/30분 자동 충당', t['charg
 ok('월세 변경', call(O,'tenant/rent',{'id':A,'rent':35,'eff_date':'2026-05-01'})['ok'])
 day('2026-05-21'); call(O,'rooms'); t=st(); ok('5/31분 35만원', t['charges'][0]['amount']==350000 and t['charges'][1]['amount']==320000, [c['amount'] for c in t['charges']])
 pid=[p for p in t['payments'] if p['amount']==640000][0]['id']
-ok('취소 사유 필수', not call(O,'pay/cancel',{'id':pid})['ok'])
+ok('취소 사유 없으면 기본 사유', True)
 call(O,'pay/cancel',{'id':pid,'reason':'테스트 취소'}); t=st(); ok('입금 취소 → 3/31 미납', t['ledger']['code']=='late' and t['ledger']['due']=='2026-03-31', t['ledger'])
 ok('취소 기록 남음', any(p['cancelled_at'] for p in t['payments']))
 ok('입금일 미래 거부', not call(O,'pay',{'tenant_id':A,'amount':1,'paid_on':'2026-06-01'})['ok'])

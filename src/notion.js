@@ -1,9 +1,9 @@
-/* 노션 – 처음 한 번 가져오기 + 사이트 → 노션 한 방향 동기화
-   - 사이트 데이터가 기준. 노션에서 고친 값은 가져오지 않고 다음 동기화 때 덮어씀
-   - 마스터(비번)는 보내지 않음 (노션에 남아 있던 값은 지움)
-   - 실패해도 사이트 데이터에는 영향 없음 → 대기열에 남겨 다시 시도 */
+/* 노션 – 처음 한 번 가져오기 + 관리자가 누를 때 백업
+   - 가져온 뒤부터 사이트 데이터가 기준 (자동 동기화 없음, 기존 노션 DB는 보관용)
+   - [노션에 백업]: 누를 때마다 "입실자 현황 YYYY-MM-DD" 새 페이지 + 현재 입실자 표 + 퇴실 기록 표
+   - 마스터(비번)는 백업에 넣지 않음, '노션에 보내지 않음' 입실자는 이름·전화 가림 */
 import { getSetting, setSetting, audit } from './db.js';
-import { kstToday, parseYmd, cycleIndex, dueByCycle } from './dates.js';
+import { kstToday, parseYmd, cycleIndex, dueByCycle, addDays } from './dates.js';
 
 import { ensureCharges, chargesOf, statusOf } from './ledger.js';
 
@@ -122,146 +122,100 @@ export async function importRun(env, admin, today = kstToday(), choices = {}) {
   return { rooms, tenants, notionRows: plan.length };
 }
 
-/* ── 동기화 ── */
-// 노션 DB에 실제로 있는 칸 이름 (하루 한 번 새로 읽음) → 없는 칸은 보내지 않음 (다른 고시원 노션 호환)
-async function propsOf(env, dbId) {
-  const key = 'notionProps:' + dbId;
-  const c = await getSetting(env.DB, key, null);
-  if (c && Date.now() - c.t < 24 * 3600 * 1000) return new Set(c.names);
-  const d = await nf(env, 'databases/' + dbId);
-  const names = Object.keys(d.properties || {});
-  await setSetting(env.DB, key, { t: Date.now(), names });
-  return new Set(names);
-}
-function only(props, names) {
-  const out = {};
-  for (const k of Object.keys(props)) if (names.has(k)) out[k] = props[k];
-  return out;
-}
-export async function enqueue(db, kind, id) {
-  if (!id) return;
-  await db.prepare('INSERT OR IGNORE INTO notion_queue (kind, ref_id) VALUES (?, ?)').bind(kind, id).run();
-}
-const STATE_KO = { in: '입실', leaving: '퇴실예정', reserved: '입실예정', vacant: '공실', repair: '공실', office: '사무실' };
-const rt = (s) => ({ rich_text: s ? [{ type: 'text', text: { content: String(s).slice(0, 1900) } }] : [] });
-const KIND_KO = { d10: 'D-10', d1: 'D-1', dp1: 'D+1', dp3: 'D+3', notice: '공지', test: '시험' };
-async function roomProps(env, room) {
+/* ── 백업 ── */
+const rt = (s) => [{ type: 'text', text: { content: String(s == null ? '' : s).slice(0, 1900) } }];
+const man = (won) => (won == null ? '' : String(Math.round(won / 1000) / 10));
+const STATE_KO = { in: '입실', leaving: '퇴실예정', reserved: '입실예정', out: '퇴실', cancelled: '입실 취소' };
+const LEDGER_KO = { paid: '입금됨', upcoming: '납부 예정', partial: '부분 입금', today: '오늘 납부일', late: '미납' };
+export const BACKUP_KEEP_YEARS = 3; // 이보다 오래된 백업은 화면에 '삭제 권장' 표시 (자동으로 지우지는 않음)
+
+// 백업 페이지를 만들 위치: 설정값이 없으면 입실자 현황 DB가 들어 있는 페이지
+async function backupParent(env) {
   const db = env.DB;
-  const t = await db.prepare("SELECT * FROM tenants WHERE room_id = ? AND status IN ('reserved', 'in', 'leaving')").bind(room.id).first();
-  const state = room.kind === 'office' ? 'office' : t ? t.status : room.repair ? 'repair' : 'vacant';
-  const props = {
-    호실: { title: [{ type: 'text', text: { content: room.no } }] },
-    상태: { select: { name: STATE_KO[state] } },
-    타입: room.type ? { select: { name: room.type } } : { select: null },
-    마스터: rt('') // 사이트에만 보관
-  };
-  if (!t) {
-    Object.assign(props, { 이름: rt(''), 전화번호: { phone_number: null }, 입실일: { date: null }, 월세: { number: null }, 보증금: { number: null }, 성별: { select: null }, 입금: { checkbox: false }, 현금영수증: { checkbox: false }, 비고: rt(room.repair ? '수리중' : ''), '문자 제외': { checkbox: false }, 안내기록: rt(''),
-      '다음 납부일': { date: null }, '계약 단위': { select: null }, 미납: { number: null }, 퇴실예정일: { date: null } });
-    return props;
+  const set = dbIdOf(await getSetting(db, 'notionBackupParent', ''));
+  if (set) return set;
+  const roomsDb = dbIdOf(await getSetting(db, 'notionRoomsDb', ''));
+  if (!roomsDb) throw new Error('설정에 노션 입실자 현황 주소나 백업 위치 페이지를 넣어 주세요');
+  let parent = (await nf(env, 'databases/' + roomsDb)).parent;
+  for (let i = 0; i < 5 && parent; i++) {
+    if (parent.type === 'page_id') {
+      const pg = await nf(env, 'pages/' + parent.page_id);
+      const title = Object.values(pg.properties || {}).map((p) => (p.title || []).map((x) => x.plain_text).join('')).join('').trim();
+      if (title || !pg.parent || pg.parent.type === 'workspace') return parent.page_id;
+      parent = pg.parent; // 제목 없는 칸(열·토글)이면 한 단계 위 페이지로
+    } else if (parent.type === 'block_id') {
+      parent = (await nf(env, 'blocks/' + parent.block_id)).parent;
+    } else break;
   }
-  let paid = false, nextDue = null, owed = null;
-  if (t.status !== 'reserved') {
-    const ch = (await chargesOf(db, [t.id]))[t.id] || [];
-    const st = statusOf(t, ch, kstToday());
-    paid = st.code === 'paid';
-    nextDue = st.nextDue || null;
-    owed = st.owed ? st.owed / 10000 : 0;
-  }
-  const { results: sms } = await db.prepare("SELECT kind, status, updated_at FROM sms_log WHERE tenant_id = ? AND slot = 'T' ORDER BY id DESC LIMIT 3").bind(t.id).all();
-  const smsText = (sms || []).map((x) => new Date(x.updated_at.replace(' ', 'T') + 'Z').toISOString().slice(5, 10).replace('-', '/') + ' ' + (KIND_KO[x.kind] || x.kind) + (x.status === 'sent' ? '' : '(' + x.status + ')')).join(', ');
-  const hide = !!t.notion_off; // 본인이 국외 이전을 원하지 않음 → 이름·전화·비고 보내지 않음
-  Object.assign(props, {
-    이름: rt(hide ? '(비공개)' : t.name), 전화번호: { phone_number: hide ? null : t.phone }, 입실일: { date: { start: t.move_in } }, 월세: { number: t.rent / 10000 }, 보증금: { number: t.deposit / 10000 },
-    성별: t.gender ? { select: { name: t.gender } } : { select: null }, 입금: { checkbox: paid }, 현금영수증: { checkbox: !!t.cash_receipt }, 비고: rt(hide ? '' : t.memo || ''), '문자 제외': { checkbox: !!t.sms_off },
-    안내기록: rt(smsText),
-    '다음 납부일': { date: nextDue ? { start: nextDue } : null }, '계약 단위': { select: { name: t.cycle === '2w' ? '2주' : '월' } },
-    미납: { number: owed }, 퇴실예정일: { date: t.leave_date ? { start: t.leave_date } : null }
-  });
-  return props;
+  throw new Error('백업할 페이지를 찾지 못했습니다. 설정에 "백업 위치 페이지" 주소를 넣어 주세요');
 }
-function outProps(t, room, owed) {
-  const anon = !!t.anon_at || !!t.notion_off;
+function tableBlock(head, rows) {
   return {
-    이름: { title: [{ type: 'text', text: { content: anon ? '(퇴실자)' : t.name } }] },
-    호실: rt(room ? room.no : ''),
-    구분: { select: { name: t.status === 'cancelled' ? '입실 취소' : '퇴실' } },
-    입실일: { date: { start: t.move_in } }, 퇴실일: t.out_date ? { date: { start: t.out_date } } : { date: null },
-    월세: { number: t.rent / 10000 }, 보증금: { number: t.deposit / 10000 },
-    반환: { number: t.dep_refund != null ? t.dep_refund / 10000 : null }, 공제: { number: t.dep_deduct != null ? t.dep_deduct / 10000 : null },
-    '공제 사유': rt(anon ? '' : t.dep_note), 미납: { number: owed / 10000 }
+    object: 'block', type: 'table',
+    table: { table_width: head.length, has_column_header: true, has_row_header: false, children: [head, ...rows].slice(0, 99).map((r) => ({ type: 'table_row', table_row: { cells: r.map((c) => rt(c)) } })) }
   };
 }
-export async function createOutDb(env) {
-  const roomsDb = dbIdOf(await getSetting(env.DB, 'notionRoomsDb', ''));
-  if (!roomsDb) throw new Error('입실자 현황 주소를 먼저 넣어 주세요');
-  const d = await nf(env, 'databases/' + roomsDb);
-  if (!d.parent || d.parent.type !== 'page_id') throw new Error('입실자 현황이 페이지 안에 있지 않아 옆에 만들 수 없습니다');
-  const num = { number: { format: 'number' } };
-  const j = await nf(env, 'databases', 'POST', {
-    parent: { type: 'page_id', page_id: d.parent.page_id },
-    title: [{ type: 'text', text: { content: '📁 퇴실 기록' } }],
-    description: [{ type: 'text', text: { content: '관리 사이트에서 자동으로 채움 (보기 전용). 금액 단위 만원. 퇴실 3년 뒤 이름은 자동으로 지워짐' } }],
-    is_inline: true,
-    properties: { 이름: { title: {} }, 호실: { rich_text: {} }, 구분: { select: { options: [{ name: '퇴실', color: 'gray' }, { name: '입실 취소', color: 'red' }] } }, 입실일: { date: {} }, 퇴실일: { date: {} }, 월세: num, 보증금: num, 반환: num, 공제: num, '공제 사유': { rich_text: {} }, 미납: num }
-  });
-  await setSetting(env.DB, 'notionOutDb', j.id);
-  return j.id;
-}
-async function syncOne(env, item) {
+export async function backupToNotion(env, admin, today) {
   const db = env.DB;
-  if (item.kind === 'room') {
-    const room = await db.prepare('SELECT * FROM rooms WHERE id = ?').bind(item.ref_id).first();
-    if (!room) return;
-    const dbId0 = dbIdOf(await getSetting(db, 'notionRoomsDb', ''));
-    const props = only(await roomProps(env, room), await propsOf(env, dbId0));
-    if (room.notion_id) {
-      await nf(env, 'pages/' + room.notion_id, 'PATCH', { properties: props });
-    } else {
-      const dbId = dbIdOf(await getSetting(db, 'notionRoomsDb', ''));
-      if (!dbId) throw new Error('입실자 현황 주소 없음');
-      const p = await nf(env, 'pages', 'POST', { parent: { database_id: dbId }, properties: props });
-      await db.prepare('UPDATE rooms SET notion_id = ? WHERE id = ?').bind(p.id, room.id).run();
-    }
-  } else if (item.kind === 'out') {
-    const t = await db.prepare('SELECT * FROM tenants WHERE id = ?').bind(item.ref_id).first();
-    if (!t || (t.status !== 'out' && t.status !== 'cancelled')) return;
-    const outDb = dbIdOf(await getSetting(db, 'notionOutDb', ''));
-    if (!outDb) throw new Error('퇴실 기록 DB가 없습니다 (설정에서 만들기)');
-    const room = await db.prepare('SELECT no FROM rooms WHERE id = ?').bind(t.room_id).first();
-    const ch = ((await chargesOf(db, [t.id]))[t.id] || []).filter((c) => !c.void);
-    const props = outProps(t, room, ch.reduce((a, c) => a + c.amount - c.paid, 0));
-    if (t.notion_id) await nf(env, 'pages/' + t.notion_id, 'PATCH', { properties: props });
-    else {
-      const p = await nf(env, 'pages', 'POST', { parent: { database_id: outDb }, properties: props });
-      await db.prepare('UPDATE tenants SET notion_id = ? WHERE id = ?').bind(p.id, t.id).run();
+  const { results: ts } = await db.prepare("SELECT t.*, r.no AS room, r.type AS rtype, r.sort FROM tenants t JOIN rooms r ON r.id = t.room_id WHERE t.status IN ('reserved', 'in', 'leaving') ORDER BY r.sort, r.no").all();
+  const { results: rooms } = await db.prepare('SELECT * FROM rooms ORDER BY sort, no').all();
+  const ch = await chargesOf(db, (ts || []).map((t) => t.id));
+  const byRoom = {};
+  for (const t of ts || []) byRoom[t.room_id] = t;
+  const head1 = ['호실', '상태', '이름', '전화', '계약', '금액(만원)', '보증금', '입실일', '다음 납부일', '입금 상태', '미납(만원)', '퇴실예정일', '현금영수증', '문자 제외', '비고'];
+  const rows1 = (rooms || []).map((r) => {
+    const t = byRoom[r.id];
+    if (!t) return [r.no, r.kind === 'office' ? '사무실' : r.repair ? '수리중' : '공실', '', '', '', '', '', '', '', '', '', '', '', '', r.memo || ''];
+    const hide = !!t.notion_off;
+    const st = t.status === 'reserved' ? null : statusOf(t, ch[t.id], today);
+    return [r.no, STATE_KO[t.status], hide ? '(비공개)' : t.name, hide ? '' : t.phone, t.cycle === '2w' ? '2주' : '월', man(t.rent), man(t.deposit), t.move_in,
+      st ? st.nextDue : '', st ? LEDGER_KO[st.code] + (st.code === 'late' ? ' D+' + st.days : '') : '입실 전', st && st.owed ? man(st.owed) : '', t.leave_date || '', t.cash_receipt ? 'O' : '', t.sms_off ? 'O' : '', hide ? '' : t.memo || ''];
+  });
+  // 퇴실 기록: 퇴실 3년 안 · 익명화 안 된 것만 (보관 기간 원칙)
+  const since = addDays(today, -Math.round(365.25 * 3));
+  const { results: outs } = await db.prepare("SELECT t.*, r.no AS room FROM tenants t JOIN rooms r ON r.id = t.room_id WHERE t.status IN ('out', 'cancelled') AND t.anon_at IS NULL AND t.out_date >= ? ORDER BY t.out_date DESC").bind(since).all();
+  const chOut = await chargesOf(db, (outs || []).map((t) => t.id));
+  const head2 = ['호실', '이름', '구분', '입실일', '퇴실일', '계약', '금액(만원)', '보증금', '반환', '공제', '공제 사유', '7일 전 통보', '남은 미납'];
+  const rows2 = (outs || []).map((t) => {
+    const hide = !!t.notion_off;
+    const owed = (chOut[t.id] || []).filter((c) => !c.void).reduce((a, c) => a + c.amount - c.paid, 0);
+    return [t.room, hide ? '(비공개)' : t.name, STATE_KO[t.status], t.move_in, t.out_date || '', t.cycle === '2w' ? '2주' : '월', man(t.rent), man(t.deposit), man(t.dep_refund), man(t.dep_deduct), hide ? '' : t.dep_note || '', t.status === 'out' ? (t.dep_notice ? 'O' : 'X') : '', owed ? man(owed) : ''];
+  });
+  const parent = await backupParent(env);
+  const stamp = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(11, 16);
+  const title = '입실자 현황 ' + today;
+  const para = (text) => ({ object: 'block', type: 'paragraph', paragraph: { rich_text: rt(text) } });
+  const h2 = (text) => ({ object: 'block', type: 'heading_2', heading_2: { rich_text: rt(text) } });
+  const t1 = tableBlock(head1, rows1);
+  const t2 = tableBlock(head2, rows2.length ? rows2 : [head2.map((_, i) => (i === 0 ? '없음' : ''))]);
+  const page = await nf(env, 'pages', 'POST', {
+    parent: { page_id: parent },
+    properties: { title: { title: rt(title) } },
+    children: [
+      para('관리 사이트에서 ' + today + ' ' + stamp + '에 ' + (admin ? admin.name : '') + '님이 만든 백업입니다 (보기용). 금액 단위 만원. 마스터(비번)는 넣지 않았습니다.'),
+      h2('현재 입실자 (' + (ts || []).length + '명 · 호실 ' + (rooms || []).length + '개)'), t1,
+      h2('퇴실 기록 (최근 3년 · ' + rows2.length + '건)'), t2,
+      para('퇴실 3년이 지난 사람의 정보가 든 백업은 개인정보 보관 기간이 지난 것이니 지워 주세요 (관리 사이트 설정 → 노션 백업 목록에서 [삭제]).')
+    ]
+  });
+  // 99줄 넘는 표는 나머지 줄을 이어 붙임
+  const blocks = (await nf(env, 'blocks/' + page.id + '/children?page_size=20')).results || [];
+  const tables = blocks.filter((b) => b.type === 'table');
+  const extra = [[tables[0], rows1.slice(98)], [tables[1], rows2.slice(98)]];
+  for (const [tb, rest] of extra) {
+    for (let i = 0; tb && i < rest.length; i += 100) {
+      await nf(env, 'blocks/' + tb.id + '/children', 'PATCH', { children: rest.slice(i, i + 100).map((r) => ({ type: 'table_row', table_row: { cells: r.map((c) => rt(c)) } })) });
     }
   }
+  const list = await getSetting(db, 'notionBackups', []);
+  list.unshift({ id: page.id, url: page.url || '', day: today, at: new Date().toISOString(), by: admin ? admin.name : '', current: (ts || []).length, out: rows2.length });
+  await setSetting(db, 'notionBackups', list.slice(0, 500));
+  return { url: page.url || '', title, current: (ts || []).length, out: rows2.length };
 }
-// 대기열 처리 (한 번에 max건, 실패는 남겨 두고 다음에 다시)
-export async function processQueue(env, max = 8) {
-  if (!notionReady(env) || !(await getSetting(env.DB, 'notionRoomsDb', ''))) return { skipped: true };
-  const { results } = await env.DB.prepare('SELECT * FROM notion_queue WHERE done_at IS NULL AND tries < 20 ORDER BY tries, id LIMIT ?').bind(max).all();
-  let ok = 0, failed = 0;
-  for (const it of results || []) {
-    try {
-      await syncOne(env, it);
-      await env.DB.prepare("UPDATE notion_queue SET done_at = datetime('now'), last_err = NULL WHERE id = ?").bind(it.id).run();
-      ok++;
-    } catch (e) {
-      failed++;
-      await env.DB.prepare('UPDATE notion_queue SET tries = tries + 1, last_err = ? WHERE id = ?').bind(String((e && e.message) || e).slice(0, 200), it.id).run();
-    }
-  }
-  await env.DB.prepare("DELETE FROM notion_queue WHERE done_at IS NOT NULL AND done_at < datetime('now', '-30 days')").run();
-  if (ok || failed) await setSetting(env.DB, 'notionLast', { at: new Date().toISOString(), ok, failed });
-  return { ok, failed };
-}
-export async function enqueueAll(db) {
-  const { results: keys } = await db.prepare("SELECT key FROM settings WHERE key LIKE 'notionProps:%'").all();
-  for (const k of keys || []) await db.prepare('DELETE FROM settings WHERE key = ?').bind(k.key).run();
-  const { results: rooms } = await db.prepare('SELECT id FROM rooms').all();
-  for (const r of rooms || []) await enqueue(db, 'room', r.id);
-  const { results: outs } = await db.prepare("SELECT id FROM tenants WHERE status IN ('out', 'cancelled')").all();
-  for (const t of outs || []) await enqueue(db, 'out', t.id);
+export async function deleteBackup(env, id) {
+  const db = env.DB;
+  const list = await getSetting(db, 'notionBackups', []);
+  if (!list.some((b) => b.id === id)) throw new Error('이 사이트가 만든 백업만 지울 수 있습니다');
+  try { await nf(env, 'pages/' + id, 'PATCH', { archived: true }); } catch (e) { if (!/archived|not found|Could not find/i.test(e.message)) throw e; }
+  await setSetting(db, 'notionBackups', list.filter((b) => b.id !== id));
 }

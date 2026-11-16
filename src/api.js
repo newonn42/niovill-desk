@@ -3,19 +3,11 @@ import { hashPassword, verifyPassword, createSession, currentAdmin, deleteSessio
 import { getSetting, setSetting, audit } from './db.js';
 import { kstToday, parseYmd, cycleOnOrBefore, dueDate, addDays, tenantDue, tenantIndex, cycleIndex } from './dates.js';
 import { ensureCharges, ensureAll, reallocate, chargesOf, creditOf, statusOf } from './ledger.js';
-import { smsSettings, planSms, runSms, KINDS, DEFAULT_TEMPLATES, render, bytes, typeOf, PRICE, mdw } from './sms.js';
+import { smsSettings, planSms, runSms, KINDS, DEFAULT_TEMPLATES, TEMPLATE_NAMES, URL_RE, render, bytes, typeOf, PRICE, mdw } from './sms.js';
 import { sendOne, balance, solapiReady } from './sender.js';
-import { importPreview, importRun, enqueue, processQueue, createOutDb, enqueueAll, notionReady, dbIdOf } from './notion.js';
+import { importPreview, importRun, backupToNotion, deleteBackup, notionReady, dbIdOf, BACKUP_KEEP_YEARS } from './notion.js';
 import { backupJson, restoreJson, exportCsv } from './data.js';
 
-// 바뀐 입실자·호실을 노션 동기화 대기열에
-async function touch(db, tenantId, roomId) {
-  if (tenantId) {
-    const t = await db.prepare('SELECT room_id, status FROM tenants WHERE id = ?').bind(tenantId).first();
-    if (t) { await enqueue(db, 'room', t.room_id); if (t.status === 'out' || t.status === 'cancelled') await enqueue(db, 'out', tenantId); }
-  }
-  if (roomId) await enqueue(db, 'room', roomId);
-}
 
 const json = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers: Object.assign({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }, headers) });
 const fail = (error, status = 400) => json({ ok: false, error }, status);
@@ -196,10 +188,8 @@ async function dash(env) {
   const cfg = await smsSettings(env.DB);
   const att = await env.DB.prepare("SELECT COUNT(*) AS n FROM sms_log WHERE status = 'unknown' OR (status = 'failed' AND tries >= 2)").first();
   if (att && att.n) todo.push({ kind: 'sms', text: '문자 ' + att.n + '건 결과 확인 필요 (실패·응답 없음)' });
-  const nq = await env.DB.prepare('SELECT COUNT(*) AS n FROM notion_queue WHERE done_at IS NULL AND tries >= 3').first();
-  if (nq && nq.n) todo.push({ kind: 'notion', text: '노션 동기화 ' + nq.n + '건 계속 실패 → 설정에서 확인' });
   const bal = await balanceCached(env);
-  if (bal && bal.balance + bal.point < 2000) todo.push({ kind: 'sms', text: '솔라피 잔액 ' + (bal.balance + bal.point) + '원 · 충전 필요' });
+  if (bal && bal.balance + bal.point < (cfg.balanceWarn || 5000)) todo.push({ kind: 'sms', text: '솔라피 잔액 ' + (bal.balance + bal.point) + '원 · 충전 필요' });
   const lastRun = await env.DB.prepare('SELECT day, at, mode, planned, sent, failed FROM runs ORDER BY id DESC LIMIT 1').first();
   return json({
     ok: true, today, sms: { mode: cfg.stop ? 'stopped' : cfg.testMode ? 'test' : 'live', noAccount: !String(cfg.account || '').trim(), lastRun },
@@ -285,7 +275,6 @@ async function tenantCreate(env, admin, b) {
       await audit(db, admin, '입금', manText(rent) + ' · 등록 시 이번 회차 입금됨', { tenant: id });
     }
   }
-  await touch(db, id);
   return json({ ok: true, id });
 }
 async function tenantUpdate(env, admin, b) {
@@ -325,7 +314,33 @@ async function tenantUpdate(env, admin, b) {
     await reallocate(db, t.id);
   }
   if (changes.length) await audit(db, admin, '정보 수정', changes.join(', '), { tenant: t.id, room: roomId });
-  await touch(db, t.id, roomId !== t.room_id ? t.room_id : null);
+  return json({ ok: true });
+}
+/* 납부 일정 다시 잡기 (공통): firstDue부터 새 주기. voidFrom 이후 납부분은 '해당 없음'
+   (그 납부분에 받은 돈은 새 납부분으로 넘어감). 지난 장부는 그대로 */
+async function reschedule(db, t, { cycle, rent, firstDue, voidFrom, today }) {
+  const last = await db.prepare('SELECT MAX(k) AS k FROM charges WHERE tenant_id = ?').bind(t.id).first();
+  const kBase = Math.max(last && last.k != null ? last.k + 1 : 0, t.ledger_from || 0);
+  await db.prepare('UPDATE charges SET void = 1 WHERE tenant_id = ? AND due >= ?').bind(t.id, voidFrom).run();
+  await db.prepare("UPDATE tenants SET cycle = ?, rent = ?, anchor = ?, k_base = ?, ledger_from = ?, updated_at = datetime('now') WHERE id = ?").bind(cycle, rent, firstDue, kBase, kBase, t.id).run();
+  await reallocate(db, t.id);
+  await ensureCharges(db, await tenantRow(db, t.id), today);
+}
+// 다음 납부일 직접 수정 → 이후 납부일도 그 날짜 기준으로 전체 이동 (금액·계약 단위 그대로)
+async function nextDueChange(env, admin, b) {
+  const db = env.DB;
+  const today = await todayOf(env);
+  const t = await tenantRow(db, b.id);
+  if (t.status !== 'in' && t.status !== 'leaving') bad('입실 중인 분만 바꿀 수 있습니다');
+  const date = dateOf(b.date, '새 납부일');
+  if (date < addDays(today, -31) || date > addDays(today, 120)) bad('새 납부일은 오늘 기준 한 달 전 ~ 넉 달 뒤 사이로 정해 주세요');
+  const ch = (await chargesOf(db, [t.id]))[t.id] || [];
+  const st = statusOf(t, ch, today);
+  const oldNext = st.nextDue;
+  if (oldNext === date) bad('지금 다음 납부일과 같습니다');
+  // 지금 '다음 납부일'(가장 오래된 미납분 포함)부터 새 날짜로 옮김
+  await reschedule(db, t, { cycle: t.cycle || 'month', rent: t.rent, firstDue: date, voidFrom: oldNext < date ? oldNext : date, today });
+  await audit(db, admin, '다음 납부일 변경', oldNext + ' → ' + date + ' (이후 납부일도 이 날짜 기준)', { tenant: t.id });
   return json({ ok: true });
 }
 // 계약 단위 변경 (예: 2주 → 월). 적용일부터 새 주기로 납부일 계산, 지난 장부는 그대로
@@ -339,16 +354,9 @@ async function cycleChange(env, admin, b) {
   const eff = dateOf(b.eff_date, '적용 시작');
   if (eff < addDays(today, -31)) bad('적용 시작일이 너무 지났습니다');
   if (cycle === (t.cycle || 'month') && rent === t.rent) bad('지금과 같습니다');
-  const last = await db.prepare('SELECT MAX(k) AS k FROM charges WHERE tenant_id = ?').bind(t.id).first();
-  const kBase = Math.max(last && last.k != null ? last.k + 1 : 0, t.ledger_from || 0);
-  // 적용일부터는 새 주기로 받으므로 그 뒤 납부분은 '해당 없음' (이미 받은 돈은 새 납부분으로 넘어감)
-  await db.prepare('UPDATE charges SET void = 1 WHERE tenant_id = ? AND due >= ?').bind(t.id, eff).run();
-  await db.prepare("UPDATE tenants SET cycle = ?, rent = ?, anchor = ?, k_base = ?, ledger_from = ?, updated_at = datetime('now') WHERE id = ?").bind(cycle, rent, eff, kBase, kBase, t.id).run();
+  await reschedule(db, t, { cycle, rent, firstDue: eff, voidFrom: eff, today });
   if (rent !== t.rent) await db.prepare('INSERT INTO rent_changes (tenant_id, eff_date, old_rent, new_rent, by_name) VALUES (?, ?, ?, ?, ?)').bind(t.id, eff, t.rent, rent, admin.name).run();
-  await reallocate(db, t.id);
-  await ensureCharges(db, await tenantRow(db, t.id), today);
   await audit(db, admin, '계약 단위 변경', ((t.cycle || 'month') === '2w' ? '2주 ' : '월 ') + manText(t.rent) + ' → ' + (cycle === '2w' ? '2주 ' : '월 ') + manText(rent) + ' · ' + eff + '부터 (첫 납부일)', { tenant: t.id });
-  await touch(db, t.id);
   return json({ ok: true });
 }
 async function rentChange(env, admin, b) {
@@ -367,7 +375,6 @@ async function rentChange(env, admin, b) {
     await reallocate(db, t.id);
   }
   await audit(db, admin, '월세 변경', manText(t.rent) + ' → ' + manText(rent) + ' (' + eff + '부터' + (applied ? ', 만들어진 미납분 ' + applied + '건에도 적용' : '') + ')', { tenant: t.id });
-  await touch(db, t.id);
   return json({ ok: true });
 }
 async function checkin(env, admin, b) {
@@ -386,7 +393,6 @@ async function checkin(env, admin, b) {
     await addPayment(db, admin, nt, amt, moveIn, str(b.method, 10) || '계좌', '입실일 첫 달');
     await audit(db, admin, '입금', manText(amt) + ' · 입실일 첫 달', { tenant: t.id });
   }
-  await touch(db, t.id);
   return json({ ok: true });
 }
 async function cancelReserve(env, admin, b) {
@@ -395,7 +401,6 @@ async function cancelReserve(env, admin, b) {
   if (t.status !== 'reserved') bad('입실예정인 분만 취소할 수 있습니다');
   await db.prepare("UPDATE tenants SET status = 'cancelled', out_date = ?, memo = TRIM(COALESCE(memo, '') || ' [입실 취소] ' || ?), updated_at = datetime('now') WHERE id = ?").bind(await todayOf(env), str(b.reason, 100), t.id).run();
   await audit(db, admin, '입실 취소', str(b.reason, 100), { tenant: t.id, room: t.room_id });
-  await touch(db, t.id);
   return json({ ok: true });
 }
 async function leaving(env, admin, b) {
@@ -409,7 +414,6 @@ async function leaving(env, admin, b) {
     await ensureCharges(db, await tenantRow(db, t.id), today);
     await reallocate(db, t.id);
     await audit(db, admin, '퇴실예정 취소 (계속 거주)', '', { tenant: t.id });
-    await touch(db, t.id);
     return json({ ok: true });
   }
   if (t.status !== 'in' && t.status !== 'leaving') bad('입실 중인 분만 퇴실예정으로 바꿀 수 있습니다');
@@ -421,7 +425,6 @@ async function leaving(env, admin, b) {
     await reallocate(db, t.id);
   }
   await audit(db, admin, '퇴실예정', leaveDate ? '퇴실예정일 ' + leaveDate : '날짜 미정', { tenant: t.id });
-  await touch(db, t.id);
   return json({ ok: true });
 }
 async function checkoutPreview(env, id, outDate) {
@@ -444,6 +447,7 @@ async function checkout(env, admin, b) {
   if (refund + deduct > t.deposit) bad('반환액과 공제액의 합이 보증금(' + manText(t.deposit) + ')보다 큽니다');
   const note = str(b.dep_note, 200);
   if (deduct > 0 && !note) bad('공제 사유를 적어 주세요');
+  const notice = b.dep_notice ? 1 : 0; // 퇴실 7일 전에 통보받았는지 (보증금 반환 조건)
   await db.prepare('UPDATE charges SET void = 1 WHERE tenant_id = ? AND due >= ?').bind(t.id, outDate).run();
   await reallocate(db, t.id);
   // 보증금 공제액으로 미납 월세 충당 → 장부에 '보증금 공제' 입금으로 남김
@@ -454,11 +458,10 @@ async function checkout(env, admin, b) {
     fromDeposit = Math.min(deduct, owed0);
     if (fromDeposit > 0) await addPayment(db, admin, t, fromDeposit, outDate, '보증금 공제', '퇴실 시 보증금에서 미납 월세 충당');
   }
-  await db.prepare("UPDATE tenants SET status = 'out', out_date = ?, dep_refund = ?, dep_deduct = ?, dep_note = ?, dep_done_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").bind(outDate, refund, deduct, note, t.id).run();
+  await db.prepare("UPDATE tenants SET status = 'out', out_date = ?, dep_refund = ?, dep_deduct = ?, dep_note = ?, dep_notice = ?, dep_done_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").bind(outDate, refund, deduct, note, notice, t.id).run();
   const ch = ((await chargesOf(db, [t.id]))[t.id] || []).filter((c) => !c.void);
   const owed = ch.reduce((a, c) => a + c.amount - c.paid, 0);
-  await audit(db, admin, '퇴실 처리', '퇴실일 ' + outDate + ' · 보증금 ' + manText(t.deposit) + ' 중 반환 ' + manText(refund) + (deduct ? ' · 공제 ' + manText(deduct) + ' (' + note + ')' : '') + (fromDeposit ? ' · 그중 ' + manText(fromDeposit) + ' 미납 월세 충당' : '') + (owed ? ' · 남은 미납 ' + manText(owed) : ''), { tenant: t.id, room: t.room_id });
-  await touch(db, t.id);
+  await audit(db, admin, '퇴실 처리', '퇴실일 ' + outDate + ' · 7일 전 통보 ' + (notice ? 'O' : 'X') + ' · 보증금 ' + manText(t.deposit) + ' 중 반환 ' + manText(refund) + (deduct ? ' · 공제 ' + manText(deduct) + ' (' + note + ')' : '') + (fromDeposit ? ' · 그중 ' + manText(fromDeposit) + ' 미납 월세 충당' : '') + (owed ? ' · 남은 미납 ' + manText(owed) : ''), { tenant: t.id, room: t.room_id });
   return json({ ok: true, owed });
 }
 
@@ -473,7 +476,6 @@ async function pay(env, admin, b) {
   const method = ['계좌', '현금', '카드', '기타'].includes(b.method) ? b.method : '계좌'; // '보증금 공제'는 퇴실 처리에서만
   await addPayment(db, admin, t, amount, paidOn, method, str(b.memo, 100));
   await audit(db, admin, '입금', manText(amount) + ' · ' + paidOn + ' · ' + method + (b.memo ? ' · ' + str(b.memo, 100) : ''), { tenant: t.id });
-  await touch(db, t.id);
   return json({ ok: true });
 }
 async function payCancel(env, admin, b) {
@@ -481,19 +483,25 @@ async function payCancel(env, admin, b) {
   const p = await db.prepare('SELECT * FROM payments WHERE id = ?').bind(Number(b.id)).first();
   if (!p) bad('입금 기록을 찾지 못했습니다');
   if (p.cancelled_at) bad('이미 취소된 입금입니다');
-  const reason = str(b.reason, 100);
-  if (!reason) bad('취소 사유를 적어 주세요');
+  const reason = str(b.reason, 100) || '입금 취소';
   await db.prepare("UPDATE payments SET cancelled_at = datetime('now'), cancelled_by = ?, cancel_reason = ? WHERE id = ?").bind(admin.name, reason, p.id).run();
   await reallocate(db, p.tenant_id);
   await audit(db, admin, '입금 취소', manText(p.amount) + ' (' + p.paid_on + ') · ' + reason, { tenant: p.tenant_id });
-  await touch(db, p.tenant_id);
   return json({ ok: true });
+}
+
+// 가장 최근 입금 1건 되돌리기
+async function payCancelLast(env, admin, b) {
+  const db = env.DB;
+  const p = await db.prepare('SELECT id FROM payments WHERE tenant_id = ? AND cancelled_at IS NULL ORDER BY id DESC LIMIT 1').bind(Number(b.tenant_id)).first();
+  if (!p) bad('취소할 입금이 없습니다');
+  return payCancel(env, admin, { id: p.id, reason: str(b.reason, 100) || '최근 입금 취소' });
 }
 
 /* ── 퇴실 기록 · 검색 · 이력 ── */
 async function outList(env) {
   const db = env.DB;
-  const { results } = await db.prepare("SELECT t.id, t.name, t.phone, t.status, t.move_in, t.out_date, t.rent, t.deposit, t.dep_refund, t.dep_deduct, t.dep_note, t.anon_at, r.no AS room FROM tenants t JOIN rooms r ON r.id = t.room_id WHERE t.status IN ('out', 'cancelled') ORDER BY t.out_date DESC, t.id DESC LIMIT 300").all();
+  const { results } = await db.prepare("SELECT t.id, t.name, t.phone, t.status, t.move_in, t.out_date, t.rent, t.deposit, t.dep_refund, t.dep_deduct, t.dep_note, t.dep_notice, t.cycle, t.anon_at, r.no AS room FROM tenants t JOIN rooms r ON r.id = t.room_id WHERE t.status IN ('out', 'cancelled') ORDER BY t.out_date DESC, t.id DESC LIMIT 300").all();
   const ch = await chargesOf(db, (results || []).map((t) => t.id));
   return json({ ok: true, list: (results || []).map((t) => Object.assign(t, { owed: (ch[t.id] || []).filter((c) => !c.void).reduce((a, c) => a + c.amount - c.paid, 0) })) });
 }
@@ -538,13 +546,11 @@ async function roomSave(env, admin, b) {
     if (dup) bad(no + '호가 이미 있습니다');
     await db.prepare('UPDATE rooms SET no = ?, type = ?, kind = ?, repair = ?, sort = ?, memo = ? WHERE id = ?').bind(no, type, kind, repair, sort, str(b.memo, 100), r.id).run();
     await audit(db, admin, '호실 수정', no + '호', { room: r.id });
-    await touch(db, null, r.id);
   } else {
     const dup = await db.prepare('SELECT 1 AS x FROM rooms WHERE no = ?').bind(no).first();
     if (dup) bad(no + '호가 이미 있습니다');
     const r = await db.prepare('INSERT INTO rooms (no, type, kind, repair, sort, memo) VALUES (?, ?, ?, ?, ?, ?)').bind(no, type, kind, repair, sort, str(b.memo, 100)).run();
     await audit(db, admin, '호실 추가', no + '호', { room: r.meta.last_row_id });
-    await touch(db, null, r.meta.last_row_id);
   }
   return json({ ok: true });
 }
@@ -579,14 +585,14 @@ async function smsStatus(env) {
     ok: true, today,
     mode: cfg.stop ? 'stopped' : cfg.testMode ? 'test' : 'live',
     cfg: { senderPhone: cfg.senderPhone, testPhone: cfg.testPhone, account: cfg.account, opPhones: cfg.opPhones, windowStart: cfg.windowStart, windowEnd: cfg.windowEnd, solapi: solapiReady(env) || env.SMS_MOCK === '1' }, balance: await balanceCached(env),
-    plan: items.map((i) => ({ room: i.room, name: i.name, kind: i.kind, kindName: KINDS[i.kind].name, to: i.to, due: i.due, text: i.text, type: i.type, blocked: i.blocked, retry: !!i.retryOf, tenant_id: i.tenant_id })),
+    plan: items.map((i) => ({ room: i.room, name: i.name, kind: i.kind, kindName: i.late ? 'D-10 늦은 안내' : KINDS[i.kind].name, to: i.to, due: i.due, text: i.text, type: i.type, blocked: i.blocked, retry: !!i.retryOf, tenant_id: i.tenant_id })),
     estimate: items.filter((i) => !i.blocked).reduce((a, i) => a + PRICE[i.type], 0),
     month: { count: m.n, cost: m.cost }, attention, log: log || [], runs: runs || []
   });
 }
 async function smsSettingsGet(env) {
   const cfg = await smsSettings(env.DB);
-  return json({ ok: true, cfg, kinds: KINDS, defaults: DEFAULT_TEMPLATES, solapi: solapiReady(env) || env.SMS_MOCK === '1' });
+  return json({ ok: true, cfg, kinds: TEMPLATE_NAMES, defaults: DEFAULT_TEMPLATES, solapi: solapiReady(env) || env.SMS_MOCK === '1' });
 }
 async function smsSettingsSave(env, admin, b) {
   const db = env.DB;
@@ -595,6 +601,12 @@ async function smsSettingsSave(env, admin, b) {
   if (b.senderPhone != null) next.senderPhone = b.senderPhone ? phoneOf(b.senderPhone) : '';
   if (b.testPhone != null) next.testPhone = b.testPhone ? phoneOf(b.testPhone) : '';
   if (b.opPhones != null) next.opPhones = phoneList(b.opPhones);
+  if (b.summaryPhone != null) next.summaryPhone = b.summaryPhone ? phoneOf(b.summaryPhone) : '';
+  if (b.balanceWarn != null && b.balanceWarn !== '') {
+    const w = Number(b.balanceWarn);
+    if (!Number.isFinite(w) || w < 0 || w > 1000000) bad('잔액 경고 기준을 확인해 주세요');
+    next.balanceWarn = Math.round(w);
+  }
   if (b.account != null) next.account = str(b.account, 80);
   if (b.windowStart != null) {
     const a = Number(b.windowStart), z = Number(b.windowEnd);
@@ -605,6 +617,7 @@ async function smsSettingsSave(env, admin, b) {
     next.templates = Object.assign({}, cur.templates);
     for (const k of Object.keys(DEFAULT_TEMPLATES)) if (b.templates[k] != null) {
       const t = String(b.templates[k]).slice(0, 1000).trim();
+      if (URL_RE.test(t)) bad('"' + (TEMPLATE_NAMES[k] || k) + '" 문구에 인터넷 주소가 있습니다. 스팸으로 분류될 수 있어 넣을 수 없습니다');
       next.templates[k] = t || DEFAULT_TEMPLATES[k];
     }
   }
@@ -617,6 +630,7 @@ async function smsSettingsSave(env, admin, b) {
     next.testMode = !!b.testMode;
     changes.push(b.testMode ? '테스트 모드 켬' : '⚠️ 실제 발송 시작');
   }
+  if (next.senderPhone !== cur.senderPhone && cur.senderPhone) changes.push('발신번호 ' + cur.senderPhone + ' → ' + next.senderPhone + ' (답장도 새 번호로)');
   await setSetting(db, 'sms', next, admin.name);
   await audit(db, admin, '문자 설정 저장', changes.join(', ') || '번호·계좌·문구');
   return json({ ok: true });
@@ -708,6 +722,7 @@ async function noticeBuild(env, b) {
   const db = env.DB;
   const text = str(b.text, 1000);
   if (!text) bad('보낼 내용을 입력해 주세요');
+  if (URL_RE.test(text)) bad('인터넷 주소가 있으면 스팸으로 분류될 수 있어 보낼 수 없습니다');
   const date = b.date && parseYmd(b.date) ? mdw(b.date) : '';
   if (/\{날짜\}/.test(text) && !date) bad('내용에 {날짜}가 있어 날짜를 골라 주세요');
   const biz = (await getSetting(db, 'bizName', '')) || '';
@@ -741,7 +756,6 @@ async function noticeSend(env, admin, b) {
     await db.prepare("UPDATE sms_log SET status = ?, msg_type = ?, cost = ?, msg_id = ?, group_id = ?, err = ?, updated_at = datetime('now') WHERE id = ?")
       .bind(r.ok ? 'sent' : r.unknown ? 'unknown' : 'failed', r.type || it.type, r.ok ? PRICE[r.type || it.type] : null, r.msgId || null, r.groupId || null, r.ok ? null : String(r.error || '').slice(0, 200), ins.meta.last_row_id).run();
     if (r.ok) sent++; else failed.push(it.room + '호 ' + it.name + ' (' + r.error + ')');
-    await touch(db, it.tenant_id);
   }
   await db.prepare('UPDATE runs SET sent = ?, failed = ? WHERE id = ?').bind(sent, failed.length, runId).run();
   await audit(db, admin, b.scope === 'tenant' ? '개별 문자' : '공지 문자', items.length + '명 · 보냄 ' + sent + (failed.length ? ' · 실패 ' + failed.length : '') + ' · ' + str(b.text, 40), b.scope === 'tenant' ? { tenant: items[0].tenant_id } : {});
@@ -757,18 +771,24 @@ async function noticeTemplatesSave(env, admin, b) {
   return json({ ok: true });
 }
 
-/* ── 노션 ── */
+/* ── 노션 (처음 가져오기 + 수동 백업) ── */
 async function notionGet(env) {
   const db = env.DB;
-  const q = await db.prepare("SELECT COUNT(*) AS waiting, SUM(CASE WHEN tries > 0 THEN 1 ELSE 0 END) AS failing, MAX(last_err) AS err FROM notion_queue WHERE done_at IS NULL").first();
-  return json({ ok: true, token: notionReady(env), roomsDb: await getSetting(db, 'notionRoomsDb', ''), outDb: await getSetting(db, 'notionOutDb', ''), last: await getSetting(db, 'notionLast', null), queue: q,
+  const today = await todayOf(env);
+  const limit = addDays(today, -Math.round(365.25 * BACKUP_KEEP_YEARS));
+  const backups = (await getSetting(db, 'notionBackups', [])).map((b) => Object.assign({}, b, { old: b.day < limit }));
+  return json({ ok: true, token: notionReady(env), roomsDb: await getSetting(db, 'notionRoomsDb', ''), backupParent: await getSetting(db, 'notionBackupParent', ''), backups,
     imported: (await db.prepare('SELECT COUNT(*) AS n FROM tenants').first()).n > 0 });
 }
 async function notionSettings(env, admin, b) {
   const id = dbIdOf(b.roomsDb);
-  if (!id) bad('노션 입실자 현황 데이터베이스 주소를 붙여 넣어 주세요');
-  await setSetting(env.DB, 'notionRoomsDb', id, admin.name);
-  if (b.outDb) await setSetting(env.DB, 'notionOutDb', dbIdOf(b.outDb), admin.name);
+  if (b.roomsDb && !id) bad('노션 입실자 현황 주소를 확인해 주세요');
+  if (id) await setSetting(env.DB, 'notionRoomsDb', id, admin.name);
+  if (b.backupParent != null) {
+    const p = dbIdOf(b.backupParent);
+    if (b.backupParent && !p) bad('백업 위치 페이지 주소를 확인해 주세요');
+    await setSetting(env.DB, 'notionBackupParent', p, admin.name);
+  }
   await audit(env.DB, admin, '노션 설정 저장', '');
   return json({ ok: true });
 }
@@ -779,12 +799,18 @@ async function notionAct(env, admin, path, b = {}) {
     if (path === 'notion/import') {
       const r = await importRun(env, admin, await todayOf(env), b.choices || {});
       await audit(env.DB, admin, '노션에서 처음 가져오기', '호실 ' + r.rooms + ' · 입실자 ' + r.tenants);
-      await enqueueAll(env.DB);
       return json({ ok: true, result: r });
     }
-    if (path === 'notion/outdb') { const id = await createOutDb(env); await audit(env.DB, admin, '노션 퇴실 기록 DB 만들기', ''); return json({ ok: true, id }); }
-    if (path === 'notion/resync') { await enqueueAll(env.DB); return json({ ok: true, result: await processQueue(env, 10) }); }
-    if (path === 'notion/sync') return json({ ok: true, result: await processQueue(env, 10) });
+    if (path === 'notion/backup') {
+      const r = await backupToNotion(env, admin, await todayOf(env));
+      await audit(env.DB, admin, '노션에 백업', r.title + ' · 입실자 ' + r.current + ' · 퇴실 ' + r.out);
+      return json({ ok: true, result: r });
+    }
+    if (path === 'notion/backup/delete') {
+      await deleteBackup(env, str(b.id, 60));
+      await audit(env.DB, admin, '노션 백업 삭제', str(b.day, 20));
+      return json({ ok: true });
+    }
   } catch (e) {
     if (e instanceof Bad) throw e;
     bad('노션: ' + ((e && e.message) || e));
@@ -793,7 +819,7 @@ async function notionAct(env, admin, path, b = {}) {
 }
 
 /* ── 입구 ── */
-const OWNER_ONLY = new Set(['invite', 'admin/active', 'settings', 'room/save', 'room/delete', 'admins', 'sms/settings', 'notion', 'notion/settings', 'notion/preview', 'notion/import', 'notion/outdb', 'notion/resync', 'notion/sync', 'backup', 'restore', 'export']);
+const OWNER_ONLY = new Set(['invite', 'admin/active', 'settings', 'room/save', 'room/delete', 'admins', 'sms/settings', 'notion', 'notion/settings', 'notion/preview', 'notion/import', 'notion/backup', 'notion/backup/delete', 'backup', 'restore', 'export']);
 export async function handleApi(request, env, path) {
   const db = env.DB;
   const url = new URL(request.url);
@@ -815,6 +841,8 @@ export async function handleApi(request, env, path) {
       if (path === 'tenant/update') return await tenantUpdate(env, admin, b);
       if (path === 'tenant/rent') return await rentChange(env, admin, b);
       if (path === 'tenant/cycle') return await cycleChange(env, admin, b);
+      if (path === 'tenant/nextdue') return await nextDueChange(env, admin, b);
+      if (path === 'pay/cancel-last') return await payCancelLast(env, admin, b);
       if (path === 'tenant/checkin') return await checkin(env, admin, b);
       if (path === 'tenant/cancel') return await cancelReserve(env, admin, b);
       if (path === 'tenant/leaving') return await leaving(env, admin, b);

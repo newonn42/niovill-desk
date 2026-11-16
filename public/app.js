@@ -219,7 +219,13 @@
       var chips = h('div', { class: 'chips' }, filters.map(function (f) {
         return h('button', { type: 'button', class: 'chip' + (roomFilter === f[0] ? ' on' : ''), onclick: function () { roomFilter = f[0]; Array.prototype.forEach.call(chips.children, function (c) { c.classList.remove('on'); }); this.classList.add('on'); paint(); }, text: f[1] });
       }));
-      frame('호실', {}, h('div', { class: 'sec' }, chips, listEl));
+      var lateRooms = r.rooms.filter(function (x) { return x.tenant && x.tenant.ledger && x.tenant.ledger.code === 'late'; });
+      var owedSum = lateRooms.reduce(function (a, x) { return a + x.tenant.ledger.owed; }, 0);
+      var summary = h('div', { class: 'grid3' },
+        h('div', { class: 'stat' + (lateRooms.length ? ' red' : '') }, h('span', { text: '미납' }), h('b', { text: lateRooms.length + '명' }), lateRooms.length ? h('small', { text: man(owedSum) }) : null),
+        h('div', { class: 'stat' }, h('span', { text: '퇴실예정' }), h('b', { text: r.rooms.filter(function (x) { return x.state === 'leaving'; }).length + '명' })),
+        h('div', { class: 'stat' }, h('span', { text: '공실' }), h('b', { text: r.rooms.filter(function (x) { return x.state === 'vacant'; }).length + '개' })));
+      frame('호실', {}, h('div', { class: 'sec' }, summary, chips, listEl));
       paint();
     });
   }
@@ -331,7 +337,8 @@
         h('div', { class: 'sec' },
           h('div', { class: 'card' },
             h('div', { class: 'row', style: 'align-items:center' }, h('span', { class: 'big', text: room.no + '호 ' + t.name }), h('span', { style: 'flex:0' }, statePill(t.status))),
-            l ? h('div', { style: 'margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center' }, ledgerPill(l), h('span', { class: 'note', text: '다음 납부 ' + md(l.nextDue) + (l.code === 'late' ? ' · 미납 ' + man(l.owed) : '') + (r.credit > 0 ? ' · 선입금 ' + man(r.credit) : '') })) : null,
+            l ? h('div', { style: 'margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center' }, ledgerPill(l), h('span', { class: 'note', text: '다음 납부 ' + md(l.nextDue) + (l.code === 'late' ? ' · 미납 ' + man(l.owed) : '') + (r.credit > 0 ? ' · 선입금 ' + man(r.credit) : '') }),
+              active ? h('button', { class: 'link', type: 'button', onclick: function () { nextDueSheet(t, l); }, text: '납부일 수정' }) : null) : null,
             t.status === 'leaving' ? h('p', { class: 'note', text: '퇴실예정일 ' + (t.leave_date ? md(t.leave_date) : '미정') + ' · 자동 문자 중단됨' }) : null),
           acts.length ? h('div', { style: 'display:grid;grid-template-columns:1fr 1fr;gap:8px' }, acts) : null,
           h('h2', { text: '정보' }),
@@ -340,7 +347,7 @@
               h('dt', { text: '전화' }), h('dd', null, h('a', { href: 'tel:' + t.phone, text: t.phone })),
               h('dt', { text: '입실일' }), h('dd', { text: md(t.move_in) + ' ' + t.move_in.slice(0, 4) }),
               h('dt', { text: '계약' }), h('dd', { text: (t.cycle === '2w' ? '2주 단위 · ' : '월 단위 · ') + man(t.rent) }),
-              h('dt', { text: '보증금' }), h('dd', { text: man(t.deposit) + (t.dep_done_at ? ' (반환 ' + man(t.dep_refund) + (t.dep_deduct ? ' · 공제 ' + man(t.dep_deduct) + ' ' + (t.dep_note || '') : '') + ')' : '') }),
+              h('dt', { text: '보증금' }), h('dd', { text: man(t.deposit) + (t.dep_done_at ? ' (7일 전 통보 ' + (t.dep_notice ? 'O' : 'X') + ' · 반환 ' + man(t.dep_refund) + (t.dep_deduct ? ' · 공제 ' + man(t.dep_deduct) + ' ' + (t.dep_note || '') : '') + ')' : '') }),
               h('dt', { text: '타입' }), h('dd', { text: room.type || '-' }),
               h('dt', { text: '성별' }), h('dd', { text: t.gender || '-' }),
               h('dt', { text: '마스터' }), h('dd', { text: t.master || '-' }),
@@ -358,7 +365,13 @@
               var st = c.void ? h('span', { class: 'pill', text: '해당 없음' }) : c.paid >= c.amount ? h('span', { class: 'pill g', text: '완납' }) : c.paid > 0 ? h('span', { class: 'pill a', text: '부분' }) : c.due < TODAY ? h('span', { class: 'pill r', text: '미납' }) : h('span', { class: 'pill', text: '예정' });
               return h('tr', null, h('td', { class: c.void ? 'x' : '', text: md(c.due) + ' ' + c.due.slice(2, 4) }), h('td', { class: 'num' + (c.void ? ' x' : ''), text: man(c.amount) }), h('td', { class: 'num', text: man(c.paid) }), h('td', null, st));
             })))] : null,
-          r.payments.length ? [h('h2', { text: '입금 내역' }), h('div', { class: 'card' }, h('table', { class: 'tbl' },
+          r.payments.length ? [h('div', { class: 'row', style: 'align-items:center' }, h('h2', { text: '입금 내역' }),
+            r.payments.some(function (p) { return !p.cancelled_at; }) ? h('button', { class: 'btn sm redg', style: 'flex:0;white-space:nowrap', type: 'button', onclick: function () {
+              var p = r.payments.filter(function (x) { return !x.cancelled_at; })[0];
+              if (!confirm('가장 최근 입금 ' + md(p.paid_on) + ' ' + man(p.amount) + '을(를) 취소할까요? 기록은 "취소"로 남습니다.')) return;
+              api('pay/cancel-last', { tenant_id: t.id }).then(function (x) { x.ok ? (toast('입금을 취소했습니다'), reload()) : alert(x.error); });
+            }, text: '↩ 최근 입금 취소' }) : null),
+            h('div', { class: 'card' }, h('table', { class: 'tbl' },
             h('tr', null, h('th', { text: '입금일' }), h('th', { class: 'num', text: '금액' }), h('th', { text: '내용' }), h('th', null)),
             r.payments.map(function (p) {
               var x = !!p.cancelled_at;
@@ -394,6 +407,12 @@
       h('div', { class: 'row' }, field('새 금액 (만원)', inp('number', 'rent', '', { inputmode: 'decimal', step: 'any' })), field('적용일', inp('date', 'eff_date', TODAY))),
       check('applyOpen', '이미 만들어졌지만 아직 안 받은 납부분에도 적용', false)
     ], '변경', function (d) { d.id = t.id; return api('tenant/rent', d).then(function (r) { if (r.ok) { close(); toast('월세를 바꿨습니다'); reload(); } return r; }); }));
+  }
+  function nextDueSheet(t, l) {
+    var close = sheet(t.name + ' 다음 납부일 수정', submitForm([
+      h('p', { class: 'note', text: '지금 다음 납부일: ' + md(l.nextDue) + '. 바꾸면 이후 납부일도 새 날짜 기준으로 ' + (t.cycle === '2w' ? '14일마다' : '매달 같은 날') + ' 이어집니다. 지금 미납분이 있으면 그 금액도 새 날짜로 옮겨집니다.' }),
+      field('새 다음 납부일', inp('date', 'date', l.nextDue))
+    ], '변경', function (d) { d.id = t.id; return api('tenant/nextdue', d).then(function (r) { if (r.ok) { close(); toast('납부일을 바꿨습니다'); reload(); } return r; }); }));
   }
   function cycleSheet(t, l) {
     var rentInp = inp('number', 'rent', manIn(t.rent), { inputmode: 'decimal', step: 'any' });
@@ -436,6 +455,7 @@
       field('퇴실일', outInp), info,
       h('div', { class: 'row' }, field('보증금 반환액 (만원)', inp('number', 'dep_refund', manIn(t.deposit), { inputmode: 'decimal', step: 'any' })), field('공제액 (만원)', inp('number', 'dep_deduct', '0', { inputmode: 'decimal', step: 'any' }))),
       field('공제 사유', inp('text', 'dep_note', '', { placeholder: '공제가 있으면 적어 주세요 (예: 미납 월세, 청소비)' })),
+      check('dep_notice', '퇴실 7일 전에 통보받음 (보증금 반환 대상)', t.status === 'leaving'),
       check('dep_to_rent', '공제액을 미납 월세에 먼저 충당 (장부에 "보증금 공제" 입금으로 기록)', true)
     ], '퇴실 처리', function (d) {
       d.id = t.id;
@@ -594,26 +614,21 @@
   /* ── 설정: 노션 · 백업 ── */
   function notionBox() {
     var box = h('div', { class: 'card', style: 'display:flex;flex-direction:column;gap:10px' });
+    var lastResult = null; // 백업 결과 (목록을 다시 그려도 남도록)
     function paint() {
       api('notion').then(function (r) {
         box.textContent = '';
         if (!r.ok) return add(box, h('p', { class: 'err', text: r.error }));
-        if (!r.token) add(box, h('div', { class: 'warn', text: '노션 토큰이 없습니다 (Cloudflare → 변수 및 비밀에 NOTION_TOKEN)' }));
-        add(box, submitForm([field('입실자 현황 데이터베이스 주소', inp('text', 'roomsDb', r.roomsDb, { placeholder: 'https://www.notion.so/...' })), field('퇴실 기록 데이터베이스 주소', inp('text', 'outDb', r.outDb, { placeholder: '비워 두고 아래 [만들기]를 눌러도 됨' }))], '노션 주소 저장', function (d) {
+        if (!r.token) add(box, h('div', { class: 'warn', text: '노션 토큰이 없습니다 (Cloudflare → Settings → Variables and Secrets에 NOTION_TOKEN, Secret)' }));
+        add(box, submitForm([
+          field('입실자 현황 데이터베이스 주소 (처음 가져오기용)', inp('text', 'roomsDb', r.roomsDb, { placeholder: 'https://www.notion.so/...' })),
+          field('백업 위치 페이지 주소 (선택)', inp('text', 'backupParent', r.backupParent, { placeholder: '비우면 입실자 현황이 있는 페이지' }))
+        ], '노션 주소 저장', function (d) {
           return api('notion/settings', d).then(function (x) { if (x.ok) { toast('저장했습니다'); paint(); } return x; });
         }));
-        var q = r.queue || {};
-        add(box, h('p', { class: 'note', text: '동기화: ' + (r.last ? '마지막 ' + kt(r.last.at.replace('T', ' ').slice(0, 19)) + ' · 성공 ' + r.last.ok + (r.last.failed ? ' · 실패 ' + r.last.failed : '') : '아직 없음') + ' · 대기 ' + (q.waiting || 0) + '건' + (q.failing ? ' · 재시도 중 ' + q.failing + '건 (' + (q.err || '') + ')' : '') }));
-        var act = function (path, label, conf) {
-          return h('button', { class: 'btn sm ghost', type: 'button', text: label, onclick: function () {
-            if (conf && !confirm(conf)) return;
-            var b = this; b.disabled = true;
-            api(path, {}).then(function (x) { b.disabled = false; if (!x.ok) return alert(x.error); toast('완료' + (x.result && x.result.ok != null ? ': 성공 ' + x.result.ok + ' · 실패 ' + x.result.failed : '')); paint(); });
-          } });
-        };
         if (!r.imported) {
           var prev = h('div');
-          add(box, h('div', { class: 'warn', text: '처음 한 번: 노션 입실자 현황을 이 사이트로 가져옵니다. 가져온 뒤부터는 이 사이트에서만 고치고, 노션은 보기 전용이 됩니다.' }));
+          add(box, h('div', { class: 'warn', text: '처음 한 번: 노션 입실자 현황을 이 사이트로 가져옵니다. 가져온 뒤부터는 이 사이트에서만 고치고, 노션 입실자 현황은 보관용으로 남습니다(자동 동기화 없음).' }));
           add(box, h('button', { class: 'btn sm', type: 'button', text: '1. 가져올 내용 미리보기', onclick: function () {
             prev.textContent = '불러오는 중…';
             api('notion/preview', {}).then(function (x) {
@@ -643,8 +658,33 @@
             });
           } }));
           add(box, prev);
+          return;
         }
-        add(box, h('div', { class: 'row' }, r.outDb ? null : act('notion/outdb', '퇴실 기록 DB 만들기'), act('notion/sync', '지금 동기화'), act('notion/resync', '전체 다시 보내기', '노션의 모든 줄을 사이트 내용으로 다시 덮어씁니다')));
+        // 백업
+        var res = h('div');
+        if (lastResult) add(res, lastResult);
+        add(box, h('p', { class: 'note', text: '누를 때마다 노션에 "입실자 현황 날짜" 새 페이지를 만들고 현재 입실자 표와 퇴실 기록 표(최근 3년)를 넣습니다. 기존 노션 데이터는 건드리지 않습니다. 마스터(비번)는 넣지 않습니다.' }));
+        var bb = h('button', { class: 'btn', type: 'button', text: '📤 노션에 백업', onclick: function () {
+          bb.disabled = true; res.textContent = '백업 중…';
+          api('notion/backup', {}).then(function (x) {
+            bb.disabled = false;
+            lastResult = !x.ok ? h('div', { class: 'warn', text: '❌ 실패: ' + x.error })
+              : h('div', { class: 'card' }, '✅ 성공: "' + x.result.title + '" · 입실자 ' + x.result.current + '명 · 퇴실 기록 ' + x.result.out + '건 ', x.result.url ? h('a', { href: x.result.url, target: '_blank', rel: 'noopener', text: '노션에서 열기' }) : null);
+            paint();
+          });
+        } });
+        add(box, [bb, res]);
+        var list = r.backups || [];
+        var oldOnes = list.filter(function (b) { return b.old; });
+        if (oldOnes.length) add(box, h('div', { class: 'warn', text: '3년이 지난 백업 ' + oldOnes.length + '개: 퇴실자 개인정보 보관 기간이 지났으니 지워 주세요.' }));
+        add(box, h('b', { text: '백업 목록 (' + list.length + '개)' }));
+        add(box, h('ul', { class: 'log' }, list.length ? list.slice(0, 50).map(function (b) {
+          return h('li', { class: 'row', style: 'align-items:center' }, h('span', null, b.day + ' · ' + (b.by || '') + ' · 입실자 ' + b.current + ' · 퇴실 ' + b.out + ' ', b.url ? h('a', { href: b.url, target: '_blank', rel: 'noopener', text: '열기' }) : null, b.old ? h('span', { class: 'pill a', text: ' 3년 지남' }) : null),
+            h('button', { class: 'link', style: 'flex:0;white-space:nowrap', type: 'button', text: '삭제', onclick: function () {
+              if (!confirm(b.day + ' 백업 페이지를 노션에서 지울까요? (노션 휴지통으로 이동)')) return;
+              api('notion/backup/delete', { id: b.id, day: b.day }).then(function (x) { x.ok ? (toast('지웠습니다'), paint()) : alert(x.error); });
+            } }));
+        }) : h('li', { text: '아직 없습니다' })));
       });
     }
     paint();
@@ -683,7 +723,8 @@
         r.list.length ? h('ul', { class: 'list' }, r.list.map(function (x) {
           return h('li', { class: 'room', onclick: function () { location.hash = '#/t/' + x.id; } },
             h('div', { class: 'hd' }, h('span', { class: 'no', text: x.room }), h('span', { class: 'ty', text: x.name }), statePill(x.status)),
-            h('div', { class: 'line' }, h('span', { text: x.move_in + ' ~ ' + (x.out_date || '') }), x.status === 'out' ? h('span', { text: '보증금 ' + man(x.deposit) + ' · 반환 ' + man(x.dep_refund) + (x.dep_deduct ? ' · 공제 ' + man(x.dep_deduct) : '') }) : null, x.owed > 0 ? h('span', { class: 'pill r', text: '미납 ' + man(x.owed) }) : null));
+            h('div', { class: 'line' }, h('span', { text: x.move_in + ' ~ ' + (x.out_date || '') }), x.status === 'out' ? h('span', { text: '보증금 ' + man(x.deposit) + ' · 반환 ' + man(x.dep_refund) + (x.dep_deduct ? ' · 공제 ' + man(x.dep_deduct) : '') }) : null,
+              x.status === 'out' ? h('span', { class: 'pill ' + (x.dep_notice ? 'g' : 'a'), text: x.dep_notice ? '7일 전 통보 O' : '7일 전 통보 X' }) : null, x.owed > 0 ? h('span', { class: 'pill r', text: '미납 ' + man(x.owed) }) : null));
         })) : h('p', { class: 'empty', text: '아직 없습니다' })));
     });
   }
@@ -716,7 +757,7 @@
         var pv = h('pre', { style: 'white-space:pre-wrap;font:inherit;font-size:12px;margin:0;background:var(--bg);padding:8px;border-radius:8px', hidden: true });
         var btn = h('button', { class: 'link', type: 'button', text: '미리보기', onclick: function () { api('sms/preview', { kind: k, text: ta.value }).then(function (x) { pv.hidden = false; pv.textContent = x.text + '\n\n(' + x.bytes + '바이트 · ' + x.type + ')'; }); } });
         var reset = h('button', { class: 'link', type: 'button', text: '기본 문구로', onclick: function () { ta.value = r.defaults[k]; } });
-        return h('div', { style: 'display:flex;flex-direction:column;gap:4px' }, h('b', { style: 'font-size:13px', text: r.kinds[k].name }), ta, h('div', { style: 'display:flex;gap:12px' }, btn, reset), pv);
+        return h('div', { style: 'display:flex;flex-direction:column;gap:4px' }, h('b', { style: 'font-size:13px', text: r.kinds[k] || k }), ta, h('div', { style: 'display:flex;gap:12px' }, btn, reset), pv);
       });
       smsBox.appendChild(submitForm([
         check('testMode', '테스트 모드 (보내지 않고 대상만 기록)', c.testMode),
@@ -724,13 +765,16 @@
         field('발신번호', inp('tel', 'senderPhone', c.senderPhone, { placeholder: '솔라피에 등록한 번호' })),
         field('시험 발송 받을 번호', inp('tel', 'testPhone', c.testPhone, { placeholder: '내 휴대폰' })),
         field('운영자 알림 번호', inp('text', 'opPhones', (c.opPhones || []).join(', '), { placeholder: '여러 개는 쉼표로' }), 'D+3 미납·입실 확인 알림을 받을 번호'),
+        field('매일 요약 문자 받을 번호', inp('tel', 'summaryPhone', c.summaryPhone, { placeholder: '예: 엄경환 휴대폰' }), '매일 9시 "오늘 n건 발송·실패·잔액" (0건인 날도). 비우면 안 보냄'),
+        field('솔라피 잔액 경고 기준 (원)', inp('number', 'balanceWarn', c.balanceWarn, { inputmode: 'numeric' })),
         field('입금계좌 문구', inp('text', 'account', c.account, { placeholder: '예: 국민 123-45-6789 (예금주 엄경환)' }), '비어 있으면 D-1·미납 문자는 보류'),
         h('div', { class: 'row' }, field('보내기 시작 (시)', inp('number', 'windowStart', c.windowStart)), field('보내기 끝 (시)', inp('number', 'windowEnd', c.windowEnd))),
-        h('p', { class: 'note', text: '문구에 쓸 수 있는 값: {상호} {호실} {이름} {납부일} {금액} {남은금액} {계좌} {퇴실통보일} {입실일} {월세} {보증금} {경과일}' })
+        h('p', { class: 'note', text: '문구는 [상호]로 시작하고 인터넷 주소는 넣지 마세요(스팸 분류). 쓸 수 있는 값: {상호} {호실} {이름} {납부일} {금액} {남은금액} {계좌} {퇴실통보일} {입실일} {월세} {보증금} {경과일}' })
       ].concat(tplFields), '문자 설정 저장', function (d) {
         var tpl = {};
         Object.keys(r.defaults).forEach(function (k) { tpl[k] = d['tpl_' + k]; });
-        var body = { testMode: d.testMode, senderPhone: d.senderPhone, testPhone: d.testPhone, opPhones: d.opPhones, account: d.account, windowStart: d.windowStart, windowEnd: d.windowEnd, templates: tpl };
+        var body = { testMode: d.testMode, senderPhone: d.senderPhone, testPhone: d.testPhone, opPhones: d.opPhones, summaryPhone: d.summaryPhone, balanceWarn: d.balanceWarn, account: d.account, windowStart: d.windowStart, windowEnd: d.windowEnd, templates: tpl };
+        if (c.senderPhone && d.senderPhone.replace(/\D/g, '') !== c.senderPhone.replace(/\D/g, '') && !confirm('발신번호를 바꾸면 입실자의 답장(퇴실 통보 포함)도 새 번호로 갑니다. 새 번호 주인에게 꼭 알려 주세요. 계속할까요?')) return Promise.resolve({ ok: false, error: '취소했습니다' });
         if (c.testMode && !d.testMode && !confirm('⚠️ 실제 발송으로 바꿉니다. 내일 오전 9시부터 입실자에게 문자가 갑니다. 계속할까요?')) return Promise.resolve({ ok: false, error: '취소했습니다' });
         return api('sms/settings', body).then(function (x) { if (x.ok) { toast('저장했습니다'); c.testMode = d.testMode; } return x; });
       }));

@@ -53,7 +53,8 @@ const ADD_COLUMNS = [
   ['tenants', 'notion_off', "INTEGER NOT NULL DEFAULT 0"],
   ['tenants', 'cycle', "TEXT NOT NULL DEFAULT 'month'"],
   ['tenants', 'anchor', 'TEXT'],
-  ['tenants', 'k_base', 'INTEGER NOT NULL DEFAULT 0']
+  ['tenants', 'k_base', 'INTEGER NOT NULL DEFAULT 0'],
+  ['tenants', 'dep_notice', 'INTEGER']
 ];
 let ready = false;
 export async function ensureSchema(db) {

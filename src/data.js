@@ -2,7 +2,6 @@
 import { getSetting, audit } from './db.js';
 import { addDays } from './dates.js';
 import { chargesOf } from './ledger.js';
-import { enqueue } from './notion.js';
 
 // 보관 기간 (개인정보처리방침과 같아야 함)
 export const KEEP = { identityYears: 3, ledgerYears: 5, auditYears: 2, runDetailDays: 365 };
@@ -59,9 +58,9 @@ export async function exportCsv(env, what, today) {
   if (what === 'tenants') {
     const { results } = await db.prepare('SELECT t.*, r.no AS room FROM tenants t JOIN rooms r ON r.id = t.room_id ORDER BY r.sort, r.no, t.id').all();
     const ch = await chargesOf(db, (results || []).map((t) => t.id));
-    head = ['호실', '이름', '전화', '상태', '계약 단위', '입실일', '퇴실예정일', '퇴실일', '금액(만원)', '보증금(만원)', '미납(만원)', '성별', '현금영수증', '문자 제외', '보증금 반환', '보증금 공제', '공제 사유', '비고'];
+    head = ['호실', '이름', '전화', '상태', '계약 단위', '입실일', '퇴실예정일', '퇴실일', '금액(만원)', '보증금(만원)', '미납(만원)', '성별', '현금영수증', '문자 제외', '보증금 반환', '보증금 공제', '공제 사유', '7일 전 통보', '비고'];
     rows = (results || []).map((t) => [t.room, t.name, t.phone, STATUS[t.status], t.cycle === '2w' ? '2주' : '월', t.move_in, t.leave_date, t.out_date, man(t.rent), man(t.deposit),
-      man((ch[t.id] || []).filter((c) => !c.void && c.due <= today).reduce((a, c) => a + c.amount - c.paid, 0)), t.gender, t.cash_receipt ? 'O' : '', t.sms_off ? 'O' : '', man(t.dep_refund), man(t.dep_deduct), t.dep_note, t.memo]);
+      man((ch[t.id] || []).filter((c) => !c.void && c.due <= today).reduce((a, c) => a + c.amount - c.paid, 0)), t.gender, t.cash_receipt ? 'O' : '', t.sms_off ? 'O' : '', man(t.dep_refund), man(t.dep_deduct), t.dep_note, t.status === 'out' ? (t.dep_notice ? 'O' : 'X') : '', t.memo]);
   } else if (what === 'arrears') {
     const { results } = await db.prepare("SELECT c.due, c.amount, COALESCE((SELECT SUM(a.amount) FROM allocations a WHERE a.charge_id = c.id), 0) AS paid, t.name, t.phone, t.status, r.no AS room FROM charges c JOIN tenants t ON t.id = c.tenant_id JOIN rooms r ON r.id = t.room_id WHERE c.void = 0 AND c.due <= ? ORDER BY r.no, c.due").bind(today).all();
     head = ['호실', '이름', '전화', '상태', '납부일', '금액(만원)', '받음(만원)', '미납(만원)', '경과일'];
@@ -93,7 +92,6 @@ export async function retention(env, today) {
       db.prepare("UPDATE audit SET detail = REPLACE(COALESCE(detail, ''), ?, '(퇴실자)') WHERE tenant_id = ?").bind(t.name, t.id),
       db.prepare("UPDATE payments SET memo = '' WHERE tenant_id = ?").bind(t.id)
     ]);
-    await enqueue(db, 'out', t.id);
   }
   const { results: old } = await db.prepare("SELECT id FROM tenants WHERE status IN ('out', 'cancelled') AND out_date IS NOT NULL AND out_date < ?").bind(y(KEEP.ledgerYears)).all();
   for (const t of old || []) {

@@ -23,7 +23,8 @@ http.createServer(async (req, res) => {
   res.writeHead(404); res.end('{}');
 }).listen(8795, '127.0.0.1');
 // ── 가짜 노션 ──
-const ROOMS_DB = '2fc80bd3fbaf83c7b7098125b187fbf8', PARENT = '3f880bd3fbaf80b4b707cfe993cc9c3d';
+const ROOMS_DB = '2fc80bd3fbaf83c7b7098125b187fbf8', PARENT = '3f880bd3fbaf80b4b707cfe993cc9c3d', MAIN = '3f880bd3fbaf809badc5dd1df8f8becb';
+const created = {}; // 백업 페이지 id → 표 블록
 const st = () => JSON.parse(fs.readFileSync(DIR + '/notion_state.json', 'utf8'));
 const t = (s) => s ? [{ plain_text: s, text: { content: s } }] : [];
 function page(r, i) {
@@ -42,6 +43,25 @@ http.createServer(async (req, res) => {
   if (req.url === '/v1/databases/' + ROOMS_DB && req.method === 'GET') {
     const names = ['호실', '상태', '이름', '전화번호', '입실일', '월세', '보증금', '타입', '성별', '마스터', '입금', '현금영수증', '비고', '문자 제외', '안내기록'].concat(s.newCols === false ? [] : ['다음 납부일', '계약 단위', '미납', '퇴실예정일']);
     return j(200, { id: ROOMS_DB, parent: { type: 'page_id', page_id: PARENT }, properties: Object.fromEntries(names.map((n) => [n, {}])) });
+  }
+  // 제목 없는 칸(열) → 그 위 '니오빌 고시원 만실 고고!' 페이지
+  if (req.url === '/v1/pages/' + PARENT && req.method === 'GET') return j(200, { id: PARENT, properties: { title: { title: [] } }, parent: { type: 'page_id', page_id: MAIN } });
+  if (req.url === '/v1/pages/' + MAIN && req.method === 'GET') return j(200, { id: MAIN, properties: { title: { title: [{ plain_text: '니오빌 고시원 만실 고고!' }] } }, parent: { type: 'workspace' } });
+  if (req.url === '/v1/pages' && req.method === 'POST' && b.parent && b.parent.page_id) {
+    const id = 'bk' + Date.now() + Math.random().toString(36).slice(2, 6);
+    const tables = (b.children || []).filter((c) => c.type === 'table').map((t, i) => ({ id: id + '-t' + i, type: 'table', rows: t.table.children.map((r) => r.table_row.cells.map((c) => c[0].text.content)) }));
+    created[id] = tables;
+    log('notion.log', { op: 'backup', id, parent: b.parent.page_id, title: b.properties.title.title[0].text.content, tables: tables.map((t) => t.rows), blocks: (b.children || []).length });
+    return j(200, { id, url: 'https://www.notion.so/' + id });
+  }
+  if (/^\/v1\/blocks\/[^/]+\/children/.test(req.url) && req.method === 'GET') {
+    const id = req.url.split('/')[3]; return j(200, { results: (created[id] || []).map((t) => ({ id: t.id, type: 'table' })) });
+  }
+  if (/^\/v1\/blocks\/[^/]+\/children/.test(req.url) && req.method === 'PATCH') {
+    log('notion.log', { op: 'append', table: req.url.split('/')[3], rows: b.children.map((r) => r.table_row.cells.map((c) => c[0].text.content)) }); return j(200, {});
+  }
+  if (req.url.startsWith('/v1/pages/bk') && req.method === 'PATCH') { log('notion.log', { op: 'archive', id: req.url.slice(10), archived: b.archived }); return j(200, {}); }
+  if (false) {
   }
   if (req.url.startsWith('/v1/pages/') && req.method === 'PATCH' && s.newCols === false && b.properties && (b.properties['계약 단위'] || b.properties['미납'])) return j(400, { message: '계약 단위 is not a property that exists.' });
   if (req.url === '/v1/databases' && req.method === 'POST') { log('notion.log', { op: 'createdb', parent: b.parent, title: b.title[0].text.content, props: Object.keys(b.properties) }); return j(200, { id: '0dbd0000000000000000000000000000' }); }

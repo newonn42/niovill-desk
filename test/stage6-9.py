@@ -21,7 +21,7 @@ call('sms/settings',{'senderPhone':'010-5872-6575','testPhone':'010-5872-6575','
 r=call('sms/test',{}); ok('시험 발송 (서명 검증 통과)', r.get('ok'), r)
 sl=lines('solapi.log'); ok('발신·수신 번호 숫자만', sl and sl[-1]['from']=='01058726575' and sl[-1]['to']=='01058726575', sl[-1:])
 st=call('sms'); ok('잔액 표시 4,500원', st['balance'] and st['balance']['balance']==4500, st.get('balance'))
-d=call('dash'); ok('잔액 2,000원 이상이면 충전 알림 없음', not any('잔액' in t['text'] for t in d['todo']))
+d=call('dash'); ok('잔액 4,500원 < 기준 5,000원 → 충전 알림', any('잔액' in t['text'] for t in d['todo']), d['todo'])
 # ── 8. 노션 가져오기 ──
 ok('노션 주소 저장', call('notion/settings',{'roomsDb':'https://app.notion.com/p/2fc80bd3fbaf83c7b7098125b187fbf8'})['ok'])
 pv=call('notion/preview',{}); bad=[x for x in pv['rows'] if x['issues']]
@@ -44,34 +44,33 @@ for no,x in by.items():
         if not any(c['paid']==c['amount'] for c in tt['charges']): mism.append(no+'배정')
 ok('가져온 값 대조 (이름·월세·입실일·입금)', not mism, mism)
 t1=call('tenant?id=%d'%by['201']['tenant']['id'])['tenant']; ok('마스터는 사이트에 저장', t1['master']=='#0000')
-# 동기화
-time.sleep(1); r=call('notion/resync',{}); ok('노션 동기화 실행', r.get('ok'), r)
-for i in range(3): call('notion/sync',{})
-nl=[x for x in lines('notion.log') if x['op']=='patch']
-ok('노션 18줄 덮어쓰기', len({x['id'] for x in nl})==18, len({x['id'] for x in nl}))
-ok('마스터는 빈칸으로 보냄 (노션에서 지움)', all(x['props']['마스터']['rich_text']==[] for x in nl))
-p201=[x for x in nl if x['id']=='page-201'][-1]['props']; ok('노션 값: 이름·월세(만원)·입금', p201['이름']['rich_text'][0]['text']['content']=='김가람' and p201['월세']['number']==30 and '입금' in p201)
-ok('노션 새 칸: 다음 납부일·계약 단위·미납·퇴실예정일', p201['다음 납부일']['date'] and p201['계약 단위']['select']['name']=='월' and p201['미납']['number'] is not None and '퇴실예정일' in p201, {k:p201.get(k) for k in ['다음 납부일','계약 단위','미납','퇴실예정일']})
-nstate(newCols=False); call('notion/resync',{}); call('notion/sync',{}); call('notion/sync',{})
-last=[x for x in lines('notion.log') if x['op']=='patch'][-1]['props']
-ok('새 칸이 없는 노션(다른 고시원)에는 그 칸을 빼고 보냄', '계약 단위' not in last and '이름' in last and call('notion')['queue']['waiting']==0, (list(last.keys()), call('notion')['queue']))
-nstate(newCols=True)
-ok('퇴실 기록 DB 만들기', call('notion/outdb',{})['ok'])
-cdb=[x for x in lines('notion.log') if x['op']=='createdb']; ok('입실자 현황과 같은 페이지 아래에 생성', cdb and cdb[-1]['parent']['page_id']=='3f880bd3fbaf80b4b707cfe993cc9c3d' and '이름' in cdb[-1]['props'])
-tid=by['303']['tenant']['id']
-call('tenant/checkout',{'id':tid,'out_date':'2026-11-13','dep_refund':50,'dep_deduct':0}); time.sleep(1.5); call('notion/sync',{})
-outp=[x for x in lines('notion.log') if x['op']=='create' and x['parent'].get('database_id','').startswith('0dbd')]
-ok('퇴실하면 노션 퇴실 기록에 추가 (전화번호 없음)', outp and '전화번호' not in outp[-1]['props'] and outp[-1]['props']['이름']['title'][0]['text']['content']=='최라온' if False else bool(outp) and '전화번호' not in outp[-1]['props'], outp[-1:])
-nstate(down=True)
-r=call('pay',{'tenant_id':by['201']['tenant']['id'],'amount':1,'paid_on':'2026-11-13'}); ok('노션이 멈춰도 사이트 입금은 정상', r.get('ok'))
-time.sleep(1); call('notion/sync',{}); n=call('notion'); ok('실패는 대기열에 남음', n['queue']['waiting']>=1 and n['queue']['failing']>=1, n['queue'])
-nstate(down=False); call('notion/sync',{}); n=call('notion'); ok('노션 복구 후 대기열 비움', n['queue']['waiting']==0, n['queue'])
+# ── 노션 백업 (자동 동기화 없음) ──
+before=len(lines('notion.log'))
+ok('가져온 뒤 자동 동기화 없음 (노션 수정 0건)', not any(x['op']=='patch' for x in lines('notion.log')))
+r=call('notion/backup',{}); ok('노션에 백업 성공', r.get('ok') and r['result']['current']==15, r)
+bk=[x for x in lines('notion.log') if x['op']=='backup'][-1]
+ok('백업 위치: 니오빌 고시원 만실 고고! (제목 없는 칸 건너뜀)', bk['parent']=='3f880bd3fbaf809badc5dd1df8f8becb', bk['parent'])
+ok('제목 "입실자 현황 날짜"', bk['title'].startswith('입실자 현황 2026-'), bk['title'])
+t1,t2=bk['tables']
+ok('표 2개: 현재 18호실 + 퇴실 기록', len(t1)==19 and t1[0][0]=='호실' and t2[0][0]=='호실', (len(t1),len(t2)))
+ok('마스터(비번) 없음', not any('#0' in c for row in t1 for c in row) and '마스터' not in t1[0])
+call('tenant/update',{'id':by['202']['tenant']['id'],'name':'이나래','phone':'010-2000-0002','deposit':50,'notion_off':True})
+call('notion/backup',{}); bk2=[x for x in lines('notion.log') if x['op']=='backup'][-1]
+row202=[r for r in bk2['tables'][0] if r[0]=='202'][0]; ok('"노션에 보내지 않음" → 이름·전화 가림', row202[2]=='(비공개)' and row202[3]=='', row202)
+nb=call('notion'); ok('백업 목록 2개 (개수 제한 없음)', len(nb['backups'])==2)
+ok('백업 삭제 (노션 휴지통)', call('notion/backup/delete',{'id':nb['backups'][-1]['id'],'day':'x'})['ok'] and any(x['op']=='archive' for x in lines('notion.log')))
+ok('다른 페이지는 삭제 거부', not call('notion/backup/delete',{'id':'page-201'})['ok'])
+tid=by['304']['tenant']['id']
+call('tenant/checkout',{'id':tid,'out_date':'2026-11-13','dep_refund':50,'dep_deduct':0,'dep_notice':True})
+call('notion/backup',{}); bk3=[x for x in lines('notion.log') if x['op']=='backup'][-1]
+ok('퇴실 기록 표에 7일 전 통보 O', any(r[1]=='서파랑' and r[11]=='O' for r in bk3['tables'][1]), bk3['tables'][1][:3])
+nstate(down=True); r=call('notion/backup',{}); ok('노션 오류면 화면에 실패 표시', not r['ok'] and '노션' in r['error'], r); nstate(down=False)
 # ── 7. 공지 ──
 pv=call('notice/preview',{'scope':'all','text':'[{상호}] {이름}님 {날짜} 방역','date':'2026-11-20'})
 live=[x for x in call('rooms')['rooms'] if x['state']=='in']
 ok('공지 대상 = 입실 중인 사람', pv['ok'] and pv['count']==len(live), (pv.get('count'),len(live)))
 ok('{날짜} 없으면 거부', not call('notice/preview',{'scope':'all','text':'{날짜} 방역'})['ok'])
-pv2=call('notice/preview',{'scope':'all','text':'방역','includeLeaving':True,'includeReserved':True}); ok('퇴실예정·입실예정 포함 선택', pv2['count']==pv['count']+2, (pv2['count'],pv['count']))
+pv2=call('notice/preview',{'scope':'all','text':'방역','includeLeaving':True,'includeReserved':True}); ok('퇴실예정·입실예정 포함 선택 (퇴실예정 1명은 앞에서 퇴실 처리됨)', pv2['count']==pv['count']+1, (pv2['count'],pv['count']))
 ok('인원 바뀌면 보내기 거부', not call('notice/send',{'scope':'all','text':'방역','expect':999})['ok'])
 before=len(lines('solapi.log'))
 r=call('notice/send',{'scope':'rooms','rooms':[by['201']['id'],by['204']['id'],by['205']['id']],'text':'[{상호}] {호실}호 {이름}님 안내','expect':3})
@@ -96,9 +95,9 @@ ok('복구 후 백업 시점과 같음 (기록 표 제외)', all(t2[k]==counts[k
 # ── 보관 기간 ──
 call('dev/today',{'date':'2029-12-01'}); urllib.request.urlopen(B+'cdn-cgi/handler/scheduled?cron=0+0+*+*+*').read(); time.sleep(2)
 t3=call('tenant?id=%d'%tid)['tenant']; ok('퇴실 3년 뒤 이름·전화·마스터 삭제', t3['name']=='(퇴실자)' and t3['phone']=='' and t3['master']=='' and t3['anon_at'], t3)
-call('notion/sync',{}); 
-anon=[x for x in lines('notion.log') if x['op']=='patch' and x['id'].startswith('new-') and x['props'].get('이름',{}).get('title',[{}])[0].get('text',{}).get('content')=='(퇴실자)']
-ok('노션 퇴실 기록도 (퇴실자)로', bool(anon))
+call('notion/backup',{}); bk4=[x for x in lines('notion.log') if x['op']=='backup'][-1]
+ok('3년 지난 퇴실자는 백업 퇴실 표에서 빠짐', not any('서파랑' in r or '(퇴실자)' in r for r in bk4['tables'][1]), bk4['tables'][1][:2])
+nb=call('notion'); ok('3년 지난 백업에 "3년 지남" 표시', any(b['old'] for b in nb['backups']))
 call('dev/today',{'date':'2031-12-01'}); urllib.request.urlopen(B+'cdn-cgi/handler/scheduled?cron=0+0+*+*+*').read(); time.sleep(2)
 td=call('tenant?id=%d'%tid); ok('퇴실 5년 뒤 장부 삭제', len(td['charges'])==0 and len(td['payments'])==0, (len(td['charges']),len(td['payments'])))
 print('FAIL',fails) if fails else print('ALL PASS')

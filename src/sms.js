@@ -2,27 +2,31 @@
 import { getSetting, setSetting, audit } from './db.js';
 import { diffDays, addDays, kstToday } from './dates.js';
 import { ensureAll, chargesOf } from './ledger.js';
-import { sendOne } from './sender.js';
-import { enqueue } from './notion.js';
+import { sendOne, balance } from './sender.js';
 
 // 종류: 보내는 기간(납부일 기준 일수, 시작~끝 – 끝까지는 놓친 날 보완)
+// 놓친 날 규칙: "보낼 날 ~ 다음 단계 전날" 사이에 아직 안 보냈으면 1번
+// D-10은 D-8까지 원래 문구(퇴실 7일 전 통보 조항), D-7~D-2는 '늦은 안내' 문구 (같은 고유키라 둘 중 하나만)
 export const KINDS = {
-  d10: { name: 'D-10 납부 예정·퇴실 확인', from: -10, to: -8 },
+  d10: { name: 'D-10 납부 예정·퇴실 확인', from: -10, to: -2, lateFrom: -7 },
   d1: { name: 'D-1 납부 안내', from: -1, to: 0, needAccount: true },
-  dp1: { name: 'D+1 1차 미납 안내', from: 1, to: 2, needAccount: true },
-  dp3: { name: 'D+3 2차 미납 안내', from: 3, to: 5, needAccount: true },
-  op3: { name: '운영자: 미납 전화 확인', operator: true },
-  opin: { name: '운영자: 입실 확인', operator: true }
+  dp1: { name: 'D+1 미납 안내', from: 1, to: 2, needAccount: true },
+  op3: { name: '운영자: D+3 미납 전화 확인', from: 3, to: 5, operator: true },
+  opin: { name: '운영자: 입실 확인', operator: true },
+  summary: { name: '운영자: 매일 요약', operator: true }
 };
+export const TEMPLATE_NAMES = { d10: 'D-10 납부 예정·퇴실 확인 (D-10~D-8)', d10late: 'D-10 늦은 안내 (D-7~D-2, 보증금 조항 없음)', d1: 'D-1 납부 안내', dp1: 'D+1 미납 안내', op3: '운영자: D+3 미납 전화 확인', opin: '운영자: 입실 확인' };
 export const DEFAULT_TEMPLATES = {
   d10: '[{상호}] {이름}님, 다음 입실료 납부일은 {납부일}, 금액은 {금액}입니다.\n퇴실 예정이시면 {퇴실통보일}까지 이 번호로 답장 부탁드립니다. 연락이 없으시면 연장으로 안내드립니다.\n※ 퇴실 7일 전까지 미통보 시 보증금은 반환되지 않습니다.',
+  d10late: '[{상호}] {이름}님, 다음 입실료 납부일은 {납부일}, 금액은 {금액}입니다.\n퇴실 예정이시면 바로 이 번호로 답장 부탁드립니다.',
   d1: '[{상호}] {이름}님, {납부일}은 입실료 납부일입니다.\n금액: {남은금액}\n입금계좌: {계좌}\n입금 확인 후 현금영수증을 발송해 드립니다.',
   dp1: '[{상호}] {이름}님, {납부일} 입실료({남은금액})가 아직 확인되지 않았습니다.\n입금계좌: {계좌}\n이미 입금하셨다면 이 문자는 무시해 주세요.',
-  dp3: '[{상호}] {이름}님, {납부일} 입실료({남은금액})가 아직 확인되지 않아 다시 안내드립니다.\n입금계좌: {계좌}\n사정이 있으시면 이 번호로 연락 부탁드립니다.',
   op3: '[미납] {호실}호 {이름} {남은금액} ({납부일}분, D+{경과일}) — 전화 확인 필요',
   opin: '[입실 확인] {호실}호 {이름} 입실일 {입실일} — 관리 화면에서 [입실 확인]을 눌러 주세요'
 };
-export const DEFAULTS = { senderPhone: '', testPhone: '', opPhones: [], account: '', windowStart: 9, windowEnd: 20, testMode: true, stop: false, templates: DEFAULT_TEMPLATES };
+export const DEFAULTS = { senderPhone: '', testPhone: '', opPhones: [], summaryPhone: '', balanceWarn: 5000, account: '', windowStart: 9, windowEnd: 20, testMode: true, stop: false, templates: DEFAULT_TEMPLATES };
+// 문구에 인터넷 주소가 있으면 스팸으로 분류되기 쉬워 저장을 막음
+export const URL_RE = /https?:\/\/|www\.|[a-z0-9-]+\.(com|kr|net|org|co|io|me|ly|gl|link|site|shop|dev)\b/i;
 
 export async function smsSettings(db) {
   const s = await getSetting(db, 'sms', {});
@@ -74,16 +78,21 @@ export async function planSms(db, today, cfg) {
     const open = (ch[t.id] || []).filter((c) => !c.void && c.paid < c.amount);
     for (const c of open) {
       const off = diffDays(today, c.due);
-      for (const kind of ['dp3', 'dp1', 'd1', 'd10']) {
+      for (const kind of ['op3', 'dp1', 'd1', 'd10']) {
         const K = KINDS[kind];
         if (off < K.from || off > K.to) continue;
         const v = {
           상호: biz, 호실: t.room, 이름: t.name, 납부일: mdw(c.due), 금액: manText(c.amount), 남은금액: manText(c.amount - c.paid),
           계좌: cfg.account, 퇴실통보일: mdw(addDays(c.due, -7)), 입실일: mdw(t.move_in), 월세: manText(t.rent), 보증금: manText(t.deposit), 경과일: Math.max(0, off)
         };
+        if (kind === 'op3') {
+          // D+3부터는 입실자에게 보내지 않고 운영자에게만 (전화 확인)
+          for (const p of cfg.opPhones || []) push({ tenant_id: t.id, charge_id: c.id, kind: 'op3', slot: p, room: t.room, name: t.name, to: p, due: c.due, text: render(cfg.templates.op3, v), blocked: '' });
+          break;
+        }
         const blocked = K.needAccount && !String(cfg.account || '').trim() ? '계좌 문구가 비어 있음' : '';
-        push({ tenant_id: t.id, charge_id: c.id, kind, slot: 'T', room: t.room, name: t.name, to: t.phone, due: c.due, text: render(cfg.templates[kind], v), blocked });
-        if (kind === 'dp3') for (const p of cfg.opPhones || []) push({ tenant_id: t.id, charge_id: c.id, kind: 'op3', slot: p, room: t.room, name: t.name, to: p, due: c.due, text: render(cfg.templates.op3, v), blocked: '' });
+        const late = kind === 'd10' && off >= K.lateFrom;
+        push({ tenant_id: t.id, charge_id: c.id, kind, slot: 'T', room: t.room, name: t.name, to: t.phone, due: c.due, late, text: render(cfg.templates[late ? 'd10late' : kind], v), blocked });
         break; // 같은 납부분에는 하루에 한 종류만
       }
     }
@@ -96,7 +105,7 @@ export async function planSms(db, today, cfg) {
     const v = { 상호: biz, 호실: t.room, 이름: t.name, 입실일: mdw(t.move_in) };
     for (const p of cfg.opPhones || []) push({ tenant_id: t.id, charge_id: 0, kind: 'opin', slot: p, room: t.room, name: t.name, to: p, due: t.move_in, text: render(cfg.templates.opin, v), blocked: '' });
   }
-  const order = { d10: 1, d1: 2, dp1: 3, dp3: 4, op3: 5, opin: 6 };
+  const order = { d10: 1, d1: 2, dp1: 3, op3: 5, opin: 6 };
   items.sort((a, b) => (a.room < b.room ? -1 : a.room > b.room ? 1 : order[a.kind] - order[b.kind]));
   return items;
 }
@@ -125,12 +134,14 @@ export async function runSms(env, { trigger = 'manual', today = kstToday(), admi
       .bind(today, trigger, mode, items.length, sent, failed, blocked, note, JSON.stringify(detail).slice(0, 60000)).run();
     return r.meta.last_row_id;
   };
-  if (cfg.stop) { await record('stopped', 0, 0, '긴급 정지 중이라 보내지 않음'); return { mode: 'stopped', planned: items.length }; }
-  if (cfg.testMode) { await record('test', 0, 0, '테스트 모드: 보내지 않고 대상만 기록'); return { mode: 'test', planned: items.length, blocked, items }; }
+  const lateD10 = items.filter((i) => i.late && !i.blocked).length;
+  const finish = async (res) => { if (trigger === 'cron') await sendSummary(env, cfg, today, res, items, lateD10); return res; };
+  if (cfg.stop) { await record('stopped', 0, 0, '긴급 정지 중이라 보내지 않음'); return finish({ mode: 'stopped', planned: items.length, sent: 0, failed: 0, blocked }); }
+  if (cfg.testMode) { await record('test', 0, 0, '테스트 모드: 보내지 않고 대상만 기록'); return finish({ mode: 'test', planned: items.length, sent: 0, failed: 0, blocked, items }); }
   const h = kstHour();
   if (env.DEV !== '1' && (h < cfg.windowStart || h >= cfg.windowEnd)) {
     await record('deferred', 0, 0, '발송 시간대(' + cfg.windowStart + '~' + cfg.windowEnd + '시) 밖이라 보내지 않음');
-    return { mode: 'deferred', planned: items.length };
+    return finish({ mode: 'deferred', planned: items.length, sent: 0, failed: 0, blocked });
   }
   const runId = await record('live', 0, 0, '');
   let sent = 0, failed = 0, n = 0;
@@ -148,7 +159,6 @@ export async function runSms(env, { trigger = 'manual', today = kstToday(), admi
       .bind(it.to, it.text, runId, id).run();
     if (!lock.meta || lock.meta.changes !== 1) continue;
     const r = await sendOne(env, cfg, it.to, it.text);
-    await enqueue(db, 'room', (await db.prepare('SELECT room_id FROM tenants WHERE id = ?').bind(it.tenant_id).first() || {}).room_id);
     if (r.ok) {
       sent++;
       await db.prepare("UPDATE sms_log SET status = 'sent', msg_type = ?, cost = ?, msg_id = ?, group_id = ?, err = NULL, updated_at = datetime('now') WHERE id = ?").bind(r.type || it.type, PRICE[r.type || it.type] || PRICE[it.type], r.msgId || null, r.groupId || null, id).run();
@@ -162,7 +172,32 @@ export async function runSms(env, { trigger = 'manual', today = kstToday(), admi
   await cancelStale(db, items, runId);
   await db.prepare('UPDATE runs SET sent = ?, failed = ? WHERE id = ?').bind(sent, failed, runId).run();
   if (admin) await audit(db, admin, '자동 문자 수동 실행', '보냄 ' + sent + ' · 실패 ' + failed + ' · 보류 ' + blocked);
-  return { mode: 'live', planned: items.length, sent, failed, blocked };
+  return finish({ mode: 'live', planned: items.length, sent, failed, blocked });
+}
+
+/* 매일 운영자 요약 문자 (0건인 날도). 한 날짜에 한 번만 */
+async function sendSummary(env, cfg, today, res, items, lateD10) {
+  const db = env.DB;
+  const to = cfg.summaryPhone;
+  if (!to) return;
+  const biz = (await getSetting(db, 'bizName', '')) || '관리';
+  const bal = await balance(env).catch(() => null);
+  const won = bal ? bal.balance + bal.point : null;
+  const late = await db.prepare("SELECT COUNT(DISTINCT c.tenant_id) AS n FROM charges c JOIN tenants t ON t.id = c.tenant_id WHERE t.status IN ('in', 'leaving') AND c.void = 0 AND c.due < ? AND c.amount > COALESCE((SELECT SUM(a.amount) FROM allocations a WHERE a.charge_id = c.id), 0)").bind(today).first();
+  const p = today.slice(5).replace('-', '/');
+  const head = res.mode === 'stopped' ? '⛔긴급정지중' : res.mode === 'test' ? '테스트모드 대상' + res.planned + '건' : res.mode === 'deferred' ? '시간대밖 미발송' : '보냄' + res.sent + '·실패' + res.failed;
+  const parts = ['[' + biz + '] ' + p + ' 자동문자 ' + head];
+  if (res.blocked) parts.push('보류' + res.blocked);
+  parts.push('잔액 ' + (won == null ? '확인불가' : won.toLocaleString('ko-KR') + '원' + (won < (cfg.balanceWarn || 5000) ? '⚠충전필요' : '')));
+  if (late && late.n) parts.push('미납' + late.n + '명');
+  if (lateD10) parts.push('D-10늦은안내' + lateD10);
+  const text = parts.join(' · ');
+  const key = Number(today.replace(/-/g, ''));
+  const ins = await db.prepare("INSERT OR IGNORE INTO sms_log (tenant_id, charge_id, kind, slot, to_phone, text, status, tries) VALUES (0, ?, 'summary', ?, ?, ?, 'sending', 1)").bind(key, to, to, text).run();
+  if (!ins.meta || ins.meta.changes !== 1) return;
+  const r = await sendOne(env, cfg, to, text);
+  await db.prepare("UPDATE sms_log SET status = ?, msg_type = ?, cost = ?, msg_id = ?, err = ?, updated_at = datetime('now') WHERE id = ?")
+    .bind(r.ok ? 'sent' : r.unknown ? 'unknown' : 'failed', r.type || typeOf(text), r.ok ? PRICE[r.type || typeOf(text)] : null, r.msgId || null, r.ok ? null : String(r.error || '').slice(0, 200), ins.meta.last_row_id).run();
 }
 async function cancelStale(db, items, runId) {
   const keep = new Set(items.filter((i) => i.retryOf).map((i) => i.retryOf));
