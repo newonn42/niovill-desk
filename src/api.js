@@ -585,7 +585,7 @@ async function smsStatus(env) {
     ok: true, today,
     mode: cfg.stop ? 'stopped' : cfg.testMode ? 'test' : 'live',
     cfg: { senderPhone: cfg.senderPhone, testPhone: cfg.testPhone, account: cfg.account, opPhones: cfg.opPhones, windowStart: cfg.windowStart, windowEnd: cfg.windowEnd, solapi: solapiReady(env) || env.SMS_MOCK === '1' }, balance: await balanceCached(env),
-    plan: items.map((i) => ({ room: i.room, name: i.name, kind: i.kind, kindName: i.late ? 'D-10 늦은 안내' : KINDS[i.kind].name, to: i.to, due: i.due, text: i.text, type: i.type, blocked: i.blocked, retry: !!i.retryOf, tenant_id: i.tenant_id })),
+    plan: items.map((i) => ({ room: i.room, name: i.name, kind: i.kind, kindName: KINDS[i.kind].name, to: i.to, due: i.due, text: i.text, type: i.type, blocked: i.blocked, retry: !!i.retryOf, tenant_id: i.tenant_id })),
     estimate: items.filter((i) => !i.blocked).reduce((a, i) => a + PRICE[i.type], 0),
     month: { count: m.n, cost: m.cost }, attention, log: log || [], runs: runs || []
   });

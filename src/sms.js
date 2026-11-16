@@ -5,20 +5,23 @@ import { ensureAll, chargesOf } from './ledger.js';
 import { sendOne, balance } from './sender.js';
 
 // 종류: 보내는 기간(납부일 기준 일수, 시작~끝 – 끝까지는 놓친 날 보완)
-// 놓친 날 규칙: "보낼 날 ~ 다음 단계 전날" 사이에 아직 안 보냈으면 1번
-// D-10은 D-8까지 원래 문구(퇴실 7일 전 통보 조항), D-7~D-2는 '늦은 안내' 문구 (같은 고유키라 둘 중 하나만)
+// 입실자 문자는 D-10, D-7 두 가지만 (2026-11-16 단순화)
+// D-10: 놓쳤으면 D-8까지 1번. D-7: "오늘까지" 문구라 그날만.
+// D-1·D+1·운영자 미납 알림은 꺼 둠 (ACTIVE에 넣으면 다시 켜짐)
+export const ACTIVE = ['d7', 'd10'];
 export const KINDS = {
-  d10: { name: 'D-10 납부 예정·퇴실 확인', from: -10, to: -2, lateFrom: -7 },
-  d1: { name: 'D-1 납부 안내', from: -1, to: 0, needAccount: true },
-  dp1: { name: 'D+1 미납 안내', from: 1, to: 2, needAccount: true },
-  op3: { name: '운영자: D+3 미납 전화 확인', from: 3, to: 5, operator: true },
+  d10: { name: 'D-10 납부 예정·퇴실 확인', from: -10, to: -8 },
+  d7: { name: 'D-7 퇴실 통보 마감', from: -7, to: -7 },
+  d1: { name: 'D-1 납부 안내 (꺼짐)', from: -1, to: 0, needAccount: true },
+  dp1: { name: 'D+1 미납 안내 (꺼짐)', from: 1, to: 2, needAccount: true },
+  op3: { name: '운영자: D+3 미납 (꺼짐)', from: 3, to: 5, operator: true },
   opin: { name: '운영자: 입실 확인', operator: true },
   summary: { name: '운영자: 매일 요약', operator: true }
 };
-export const TEMPLATE_NAMES = { d10: 'D-10 납부 예정·퇴실 확인 (D-10~D-8)', d10late: 'D-10 늦은 안내 (D-7~D-2, 보증금 조항 없음)', d1: 'D-1 납부 안내', dp1: 'D+1 미납 안내', op3: '운영자: D+3 미납 전화 확인', opin: '운영자: 입실 확인' };
+export const TEMPLATE_NAMES = { d10: 'D-10 납부 예정·퇴실 확인', d7: 'D-7 퇴실 통보 마감 (오늘까지)', opin: '운영자: 입실 확인' };
 export const DEFAULT_TEMPLATES = {
   d10: '[{상호}] {이름}님, 다음 입실료 납부일은 {납부일}, 금액은 {금액}입니다.\n퇴실 예정이시면 {퇴실통보일}까지 이 번호로 답장 부탁드립니다. 연락이 없으시면 연장으로 안내드립니다.\n※ 퇴실 7일 전까지 미통보 시 보증금은 반환되지 않습니다.',
-  d10late: '[{상호}] {이름}님, 다음 입실료 납부일은 {납부일}, 금액은 {금액}입니다.\n퇴실 예정이시면 바로 이 번호로 답장 부탁드립니다.',
+  d7: '[{상호}] {이름}님, 오늘({퇴실통보일})이 퇴실 통보 마감일입니다.\n{납부일}에 퇴실하실 예정이면 오늘 중 이 번호로 답장 부탁드립니다. 연락이 없으시면 연장으로 처리됩니다.\n※ 미통보 시 보증금은 반환되지 않습니다.',
   d1: '[{상호}] {이름}님, {납부일}은 입실료 납부일입니다.\n금액: {남은금액}\n입금계좌: {계좌}\n입금 확인 후 현금영수증을 발송해 드립니다.',
   dp1: '[{상호}] {이름}님, {납부일} 입실료({남은금액})가 아직 확인되지 않았습니다.\n입금계좌: {계좌}\n이미 입금하셨다면 이 문자는 무시해 주세요.',
   op3: '[미납] {호실}호 {이름} {남은금액} ({납부일}분, D+{경과일}) — 전화 확인 필요',
@@ -78,7 +81,7 @@ export async function planSms(db, today, cfg) {
     const open = (ch[t.id] || []).filter((c) => !c.void && c.paid < c.amount);
     for (const c of open) {
       const off = diffDays(today, c.due);
-      for (const kind of ['op3', 'dp1', 'd1', 'd10']) {
+      for (const kind of ACTIVE) {
         const K = KINDS[kind];
         if (off < K.from || off > K.to) continue;
         const v = {
@@ -91,8 +94,7 @@ export async function planSms(db, today, cfg) {
           break;
         }
         const blocked = K.needAccount && !String(cfg.account || '').trim() ? '계좌 문구가 비어 있음' : '';
-        const late = kind === 'd10' && off >= K.lateFrom;
-        push({ tenant_id: t.id, charge_id: c.id, kind, slot: 'T', room: t.room, name: t.name, to: t.phone, due: c.due, late, text: render(cfg.templates[late ? 'd10late' : kind], v), blocked });
+        push({ tenant_id: t.id, charge_id: c.id, kind, slot: 'T', room: t.room, name: t.name, to: t.phone, due: c.due, text: render(cfg.templates[kind], v), blocked });
         break; // 같은 납부분에는 하루에 한 종류만
       }
     }
@@ -105,7 +107,7 @@ export async function planSms(db, today, cfg) {
     const v = { 상호: biz, 호실: t.room, 이름: t.name, 입실일: mdw(t.move_in) };
     for (const p of cfg.opPhones || []) push({ tenant_id: t.id, charge_id: 0, kind: 'opin', slot: p, room: t.room, name: t.name, to: p, due: t.move_in, text: render(cfg.templates.opin, v), blocked: '' });
   }
-  const order = { d10: 1, d1: 2, dp1: 3, op3: 5, opin: 6 };
+  const order = { d10: 1, d7: 2, d1: 3, dp1: 4, op3: 5, opin: 6 };
   items.sort((a, b) => (a.room < b.room ? -1 : a.room > b.room ? 1 : order[a.kind] - order[b.kind]));
   return items;
 }
@@ -190,7 +192,6 @@ async function sendSummary(env, cfg, today, res, items, lateD10) {
   if (res.blocked) parts.push('보류' + res.blocked);
   parts.push('잔액 ' + (won == null ? '확인불가' : won.toLocaleString('ko-KR') + '원' + (won < (cfg.balanceWarn || 5000) ? '⚠충전필요' : '')));
   if (late && late.n) parts.push('미납' + late.n + '명');
-  if (lateD10) parts.push('D-10늦은안내' + lateD10);
   const text = parts.join(' · ');
   const key = Number(today.replace(/-/g, ''));
   const ins = await db.prepare("INSERT OR IGNORE INTO sms_log (tenant_id, charge_id, kind, slot, to_phone, text, status, tries) VALUES (0, ?, 'summary', ?, ?, ?, 'sending', 1)").bind(key, to, to, text).run();

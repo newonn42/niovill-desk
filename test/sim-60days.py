@@ -40,7 +40,7 @@ while d<=datetime.date(2026,4,1):
         ok('실제 발송 전환', call('sms/settings',{'testMode':False})['ok'])
     if ds=='2026-02-10': call('sms/settings',{'account':'국민 123-45-6789 엄경환'})
     if ds=='2026-03-05': call('sms/stop',{'stop':True})
-    if ds=='2026-03-08': call('sms/stop',{'stop':False})   # 3/5~3/7 정지 → B의 3/15분 D-10은 3/8(D-7)에 '늦은 안내'
+    if ds=='2026-03-08': call('sms/stop',{'stop':False})   # 3/5~3/7 정지 → B의 3/15분 D-10 놓침, 3/8 D-7만
     if ds!='2026-02-18': cron()           # 2/18 하루 실행 누락
     if ds=='2026-02-20':
         cron()                            # 같은 날 두 번
@@ -58,22 +58,19 @@ q=subprocess.run(['npx','wrangler','d1','execute','desk-db','--local','--persist
 rows=json.loads(q.stdout)[0]['results']
 by=lambda n:[(r['kind'],r['due'][5:] if r['due'] else '',r['status'],r['tries']) for r in rows if r['name']==n and r['slot']=='T']
 ops=[(r['name'],r['kind'],r['status']) for r in rows if r['slot']!='T']
-print('A',by('에이')); print('B',by('비')); print('D',by('디')); print('E',by('이')); print('F',by('에프')); print('G',by('지')); print('ops',ops)
-ok('A: D-10(2/18 누락→2/19) · D-1 · D-10(3/31분), 입금 후 미납 문자 없음', by('에이')==[('d1','02-28','sent',1),('d10','02-28','sent',1),('d10','03-31','sent',1)])
-ok('B 미납: 매달 D-10·D-1·D+1만 (D+3은 입실자에게 안 감)', sorted(by('비'))==sorted([(k,'02-15','sent',1) for k in ['d10','d1','dp1']]+[(k,'03-15','sent',1) for k in ['d10','d1','dp1']]), by('비'))
-b10=[r for r in rows if r['name']=='비' and r['kind']=='d10' and r['due']=='2026-03-15'][0]['text']
-ok('정지로 D-10~D-8을 놓치면 D-7에 늦은 안내 (보증금 조항 없음)', '바로 이 번호로 답장' in b10 and '7일 전' not in b10, b10)
+ok('A: D-10(2/18 누락→2/19) · D-7 · D-10(3/31분), 3/22 입금 후 D-7 없음', by('에이')==[('d10','02-28','sent',1),('d7','02-28','sent',1),('d10','03-31','sent',1)], by('에이'))
+ok('B: 2/15분 D-10·D-7 / 3/15분은 정지로 D-10 놓침 → D-7만', by('비')==[('d10','02-15','sent',1),('d7','02-15','sent',1),('d7','03-15','sent',1)], by('비'))
+b7=[r for r in rows if r['name']=='비' and r['kind']=='d7' and r['due']=='2026-03-15'][0]['text']
+ok('D-7 문구: 오늘(3/8)이 마감 · 보증금 조항', '오늘(3월 8일(일))' in b7 and '보증금' in b7, b7)
 b10a=[r for r in rows if r['name']=='비' and r['kind']=='d10' and r['due']=='2026-02-15'][0]['text']
-ok('제때 보낸 D-10은 원래 문구 (7일 전 통보)', '7일 전' in b10a, b10a)
+ok('D-10 문구: 7일 전 통보', '7일 전' in b10a, b10a)
+ok('D-1·D+1·D+3 문자 0건 (꺼짐)', not any(r['kind'] in ('d1','dp1','op3') for r in rows))
 ok('C 문자 제외 → 0건', by('씨')==[])
-ok('D 실패 → 1번만 재시도 (tries 2)', all(r[2]=='failed' and r[3]==2 for r in by('디')) and len(by('디'))>0)
-ok('E 결과 불확실 → 다시 보내지 않음', all(r[2]=='unknown' and r[3]==1 for r in by('이')) and len(by('이'))>0)
-ok('F 퇴실예정 이후 중단 (D-10만)', by('에프')==[('d10','02-22','sent',1)])
+ok('D 실패 → D-10은 1번 재시도 (tries 2)', [r for r in by('디') if r[0]=='d10']==[('d10','02-20','failed',2),('d10','03-20','failed',2)], by('디'))
+ok('E 결과 불확실 → 다시 보내지 않음 · 2/18 누락일의 D-7은 안 감', by('이')==[('d10','02-25','unknown',1),('d10','03-25','unknown',1),('d7','03-25','unknown',1)], by('이'))
+ok('F 퇴실예정(2/17) 이후 중단', by('에프')==[('d10','02-22','sent',1),('d7','02-22','sent',1)])
 ok('H 선입금 → 0건', by('에이치')==[])
-g=[r for r in rows if r['name']=='지' and r['kind']=='d1' and r['due']=='2026-02-28']
-ok('G 부분 입금 → D-1에 남은 금액 20만원', g and '20만원' in g[0]['text'], g)
-ok('운영자: B 미납 2번 · I 입실 확인 1번', sorted([o for o in ops if o[0] in ('비','아이')])==sorted([('비','op3','sent'),('비','op3','sent'),('아이','opin','sent')]), ops)
-ok('계좌 비어 있던 2/5~2/9엔 D-1 보류', not any(r['kind']=='d1' and r['due'] and r['due']<'2026-02-10' for r in rows))
+ok('운영자: I 입실 확인 1번만 (미납 알림 없음)', [o for o in ops if o[1]!='summary']==[('아이','opin','sent')], ops)
 runs=json.loads(subprocess.run(['npx','wrangler','d1','execute','desk-db','--local','--persist-to',os.environ['PERSIST'],'--json','--command',"SELECT day, trigger, mode FROM runs ORDER BY id"],capture_output=True,text=True,cwd='/home/claude/desk').stdout)[0]['results']
 ok('2/20 자동 실행 1번만 (두 번째 건너뜀)', sum(1 for x in runs if x['day']=='2026-02-20' and x['trigger']=='cron')==1)
 ok('3/5 긴급 정지 기록', any(x['day']=='2026-03-05' and x['mode']=='stopped' for x in runs))

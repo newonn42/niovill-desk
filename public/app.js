@@ -491,10 +491,10 @@
     var m = MODE[sm.mode];
     return h('div', { class: 'card', style: 'display:flex;flex-direction:column;gap:4px;cursor:pointer', onclick: function () { location.hash = '#/sms'; } },
       h('div', null, h('span', { class: 'pill ' + m[1], text: m[0] }), sm.lastRun ? h('span', { class: 'note', text: '  마지막 실행 ' + kt(sm.lastRun.at) + ' · 대상 ' + sm.lastRun.planned + '건' + (sm.lastRun.mode === 'live' ? ' · 보냄 ' + sm.lastRun.sent + (sm.lastRun.failed ? ' · 실패 ' + sm.lastRun.failed : '') : '') }) : h('span', { class: 'note', text: '  아직 실행 기록 없음' })),
-      sm.noAccount ? h('div', { class: 'warn', text: '입금계좌 문구가 비어 있어 D-1·미납 문자가 보류됩니다 → 설정에서 입력' }) : null);
+      null);
   }
   var STATUS = { pending: ['대기', ''], sending: ['요청 중', 'b'], sent: ['성공', 'g'], failed: ['실패', 'r'], unknown: ['결과 확인 필요', 'a'], cancelled: ['취소', ''] };
-  var KIND = { d10: 'D-10 안내', d1: 'D-1 안내', dp1: 'D+1 미납', dp3: 'D+3 미납', op3: '운영자 미납 알림', opin: '운영자 입실 알림' };
+  var KIND = { d10: 'D-10 안내', d7: 'D-7 통보 마감', d1: 'D-1 안내', dp1: 'D+1 미납', dp3: 'D+3 미납', op3: '운영자 미납 알림', opin: '운영자 입실 알림' };
   var RUNMODE = { test: '테스트', live: '발송', stopped: '정지', deferred: '시간대 밖' };
   function smsView() {
     frame('문자', {}, h('p', { class: 'loading', text: '불러오는 중…' }));
@@ -764,10 +764,10 @@
         !r.solapi ? h('p', { class: 'note', text: '솔라피가 연결되기 전에는 테스트 모드만 쓸 수 있습니다.' }) : null,
         field('발신번호', inp('tel', 'senderPhone', c.senderPhone, { placeholder: '솔라피에 등록한 번호' })),
         field('시험 발송 받을 번호', inp('tel', 'testPhone', c.testPhone, { placeholder: '내 휴대폰' })),
-        field('운영자 알림 번호', inp('text', 'opPhones', (c.opPhones || []).join(', '), { placeholder: '여러 개는 쉼표로' }), 'D+3 미납·입실 확인 알림을 받을 번호'),
+        field('운영자 알림 번호', inp('text', 'opPhones', (c.opPhones || []).join(', '), { placeholder: '여러 개는 쉼표로' }), '입실예정자 입실 확인 알림을 받을 번호'),
         field('매일 요약 문자 받을 번호', inp('tel', 'summaryPhone', c.summaryPhone, { placeholder: '예: 엄경환 휴대폰' }), '매일 9시 "오늘 n건 발송·실패·잔액" (0건인 날도). 비우면 안 보냄'),
         field('솔라피 잔액 경고 기준 (원)', inp('number', 'balanceWarn', c.balanceWarn, { inputmode: 'numeric' })),
-        field('입금계좌 문구', inp('text', 'account', c.account, { placeholder: '예: 국민 123-45-6789 (예금주 엄경환)' }), '비어 있으면 D-1·미납 문자는 보류'),
+        field('입금계좌 문구', inp('text', 'account', c.account, { placeholder: '예: 국민 123-45-6789 (예금주 엄경환)' }), '지금은 문자에 쓰이지 않음 (나중에 D-1 문자를 켜면 사용)'),
         h('div', { class: 'row' }, field('보내기 시작 (시)', inp('number', 'windowStart', c.windowStart)), field('보내기 끝 (시)', inp('number', 'windowEnd', c.windowEnd))),
         h('p', { class: 'note', text: '문구는 [상호]로 시작하고 인터넷 주소는 넣지 마세요(스팸 분류). 쓸 수 있는 값: {상호} {호실} {이름} {납부일} {금액} {남은금액} {계좌} {퇴실통보일} {입실일} {월세} {보증금} {경과일}' })
       ].concat(tplFields), '문자 설정 저장', function (d) {
