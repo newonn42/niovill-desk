@@ -159,15 +159,97 @@ async function board(env) {
   const { results: rooms } = await db.prepare('SELECT * FROM rooms ORDER BY sort, no').all();
   const { results: ts } = await db.prepare("SELECT * FROM tenants WHERE status IN ('reserved', 'in', 'leaving')").all();
   const ch = await chargesOf(db, (ts || []).filter((t) => t.status !== 'reserved').map((t) => t.id));
+  // 이번 달 현금영수증 체크
+  const ym = today.slice(0, 7);
+  const { results: crs } = await db.prepare('SELECT tenant_id FROM cash_receipts WHERE ym = ?').bind(ym).all();
+  const crDone = new Set((crs || []).map((x) => x.tenant_id));
   const byRoom = {};
-  for (const t of ts || []) byRoom[t.room_id] = tenantSummary(t, statusOf(t, ch[t.id], today), today);
+  for (const t of ts || []) byRoom[t.room_id] = Object.assign(tenantSummary(t, statusOf(t, ch[t.id], today), today), { cr: crDone.has(t.id) });
   const list = (rooms || []).map((r) => {
     const t = byRoom[r.id] || null;
     const state = r.kind === 'office' ? 'office' : t ? t.status : r.repair ? 'repair' : 'vacant';
     return { id: r.id, no: r.no, type: r.type, kind: r.kind, repair: r.repair, memo: r.memo, state, tenant: t };
   });
-  return { today, rooms: list };
+  return { today, ym, rooms: list };
 }
+/* ── 현금영수증 (사람마다 달마다 체크 하나) ── */
+async function cashToggle(env, admin, b) {
+  const db = env.DB;
+  const t = await db.prepare('SELECT t.id, t.name, r.no FROM tenants t JOIN rooms r ON r.id = t.room_id WHERE t.id = ?').bind(Number(b.tenant_id)).first();
+  if (!t) bad('입실자를 찾을 수 없습니다');
+  const ym = /^\d{4}-\d{2}$/.test(String(b.ym || '')) ? b.ym : (await todayOf(env)).slice(0, 7);
+  if (b.done) await db.prepare('INSERT OR IGNORE INTO cash_receipts (tenant_id, ym, by_name) VALUES (?, ?, ?)').bind(t.id, ym, admin.name).run();
+  else await db.prepare('DELETE FROM cash_receipts WHERE tenant_id = ? AND ym = ?').bind(t.id, ym).run();
+  await audit(db, admin, b.done ? '현금영수증 체크' : '현금영수증 체크 해제', t.no + '호 ' + t.name + ' · ' + ym, { tenant: t.id });
+  return json({ ok: true, done: !!b.done });
+}
+
+/* ── 달력: 납부일·입실예정·퇴실(예정)·메모 ── */
+async function calendarGet(env, ymIn) {
+  const db = env.DB;
+  const today = await todayOf(env);
+  const ym = /^\d{4}-\d{2}$/.test(String(ymIn || '')) ? ymIn : today.slice(0, 7);
+  const from = ym + '-01';
+  const [y, m] = ym.split('-').map(Number);
+  const to = ym + '-' + String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0');
+  const { results: ts } = await db.prepare("SELECT t.*, r.no AS room FROM tenants t JOIN rooms r ON r.id = t.room_id WHERE t.status IN ('reserved', 'in', 'leaving') OR (t.status = 'out' AND t.out_date BETWEEN ? AND ?)").bind(from, to).all();
+  const { results: chs } = await db.prepare('SELECT c.id, c.tenant_id, c.k, c.due, c.amount, c.void, (SELECT COALESCE(SUM(a.amount), 0) FROM allocations a WHERE a.charge_id = c.id) AS paid FROM charges c WHERE c.due BETWEEN ? AND ?').bind(from, to).all();
+  const { results: last } = await db.prepare('SELECT tenant_id, MAX(k) AS k FROM charges GROUP BY tenant_id').all();
+  const { results: memos } = await db.prepare('SELECT id, day, text, by_name FROM memos WHERE day BETWEEN ? AND ? ORDER BY day, id').bind(from, to).all();
+  const lastK = {};
+  for (const x of last || []) lastK[x.tenant_id] = x.k;
+  const byT = {};
+  for (const t of ts || []) byT[t.id] = t;
+  const ev = [];
+  const nm = (t) => t.name || '(이름 미정)';
+  // 장부에 있는 납부일
+  for (const c of chs || []) {
+    const t = byT[c.tenant_id];
+    if (!t || c.void) continue;
+    const st = c.paid >= c.amount ? 'paid' : c.due < today ? 'late' : c.due === today ? 'today' : 'due';
+    ev.push({ day: c.due, kind: 'due', st, tid: t.id, room: t.room, name: nm(t), amount: c.amount, left: c.amount - c.paid });
+  }
+  for (const t of ts || []) {
+    // 아직 장부에 없는 앞으로의 납부일 (계약 단위로 계산한 예정)
+    if (t.status === 'in' || t.status === 'leaving') {
+      // 먼 달은 그 달 근처 회차부터 계산
+      let k = Math.max(lastK[t.id] != null ? lastK[t.id] + 1 : 0, t.ledger_from || 0, tenantIndex(t, from) - 1);
+      for (let n = 0; n < 8; n++, k++) {
+        const due = tenantDue(t, k);
+        if (due > to) break;
+        if (t.leave_date && due >= t.leave_date) break;
+        if (due >= from) ev.push({ day: due, kind: 'due', st: 'plan', tid: t.id, room: t.room, name: nm(t), amount: t.rent, left: t.rent });
+      }
+    }
+    if (t.status === 'reserved' && t.move_in >= from && t.move_in <= to) ev.push({ day: t.move_in, kind: 'in', tid: t.id, room: t.room, name: nm(t) });
+    if (t.status === 'leaving' && t.leave_date >= from && t.leave_date <= to) ev.push({ day: t.leave_date, kind: 'leave', tid: t.id, room: t.room, name: nm(t) });
+    if (t.status === 'out' && t.out_date) ev.push({ day: t.out_date, kind: 'out', tid: t.id, room: t.room, name: nm(t) });
+  }
+  for (const x of memos || []) ev.push({ day: x.day, kind: 'memo', id: x.id, text: x.text, by: x.by_name });
+  const order = { memo: 0, in: 1, leave: 2, out: 3, due: 4 };
+  ev.sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : order[a.kind] - order[b.kind] || String(a.room || '').localeCompare(String(b.room || ''), 'ko', { numeric: true })));
+  return json({ ok: true, today, ym, events: ev });
+}
+async function memoSave(env, admin, b) {
+  const db = env.DB;
+  const day = dateOf(b.day, '날짜');
+  const text = str(b.text, 200) || bad('내용을 입력해 주세요');
+  if (b.id) {
+    const r = await db.prepare("UPDATE memos SET day = ?, text = ?, by_name = ?, at = datetime('now') WHERE id = ?").bind(day, text, admin.name, Number(b.id)).run();
+    if (!r.meta.changes) bad('메모를 찾을 수 없습니다');
+  } else await db.prepare('INSERT INTO memos (day, text, by_name) VALUES (?, ?, ?)').bind(day, text, admin.name).run();
+  await audit(db, admin, b.id ? '달력 메모 수정' : '달력 메모 추가', day + ' ' + text);
+  return json({ ok: true });
+}
+async function memoDelete(env, admin, b) {
+  const db = env.DB;
+  const m = await db.prepare('SELECT * FROM memos WHERE id = ?').bind(Number(b.id)).first();
+  if (!m) bad('메모를 찾을 수 없습니다');
+  await db.prepare('DELETE FROM memos WHERE id = ?').bind(m.id).run();
+  await audit(db, admin, '달력 메모 삭제', m.day + ' ' + m.text);
+  return json({ ok: true });
+}
+
 async function roomsGet(env) {
   return json(Object.assign({ ok: true }, await board(env)));
 }
@@ -855,6 +937,9 @@ export async function handleApi(request, env, path) {
       if (path === 'tenant/leaving') return await leaving(env, admin, b);
       if (path === 'tenant/checkout') return await checkout(env, admin, b);
       if (path === 'pay') return await pay(env, admin, b);
+      if (path === 'cash/toggle') return await cashToggle(env, admin, b);
+      if (path === 'memo/save') return await memoSave(env, admin, b);
+      if (path === 'memo/delete') return await memoDelete(env, admin, b);
       if (path === 'pay/cancel') return await payCancel(env, admin, b);
       if (path === 'invite') return await inviteCreate(env, admin, b);
       if (path === 'admin/active') return await adminActive(env, admin, b);
@@ -889,6 +974,7 @@ export async function handleApi(request, env, path) {
       const q = url.searchParams;
       if (path === 'dash') return await dash(env);
       if (path === 'rooms') return await roomsGet(env);
+      if (path === 'calendar') return await calendarGet(env, q.get('ym'));
       if (path === 'tenant') return await tenantGet(env, q.get('id'));
       if (path === 'checkout/preview') return await checkoutPreview(env, q.get('id'), q.get('out_date'));
       if (path === 'out') return await outList(env);

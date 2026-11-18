@@ -45,6 +45,11 @@ const SCHEMA = [
     created_at TEXT NOT NULL DEFAULT (datetime('now')), done_at TEXT)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS notion_q_open ON notion_queue (kind, ref_id) WHERE done_at IS NULL`,
   // 변경 이력
+  // 현금영수증: 사람마다 달마다 체크 하나 (있으면 '함')
+  `CREATE TABLE IF NOT EXISTS cash_receipts (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id INTEGER NOT NULL, ym TEXT NOT NULL, by_name TEXT, at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE (tenant_id, ym))`,
+  // 달력 메모 (방보기 약속·청소 등 직접 적는 일정)
+  `CREATE TABLE IF NOT EXISTS memos (id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, text TEXT NOT NULL, by_name TEXT, at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE INDEX IF NOT EXISTS memos_day ON memos (day)`,
   `CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL DEFAULT (datetime('now')), admin_id INTEGER, who TEXT, action TEXT NOT NULL, detail TEXT, tenant_id INTEGER, room_id INTEGER)`,
   `CREATE INDEX IF NOT EXISTS audit_tenant ON audit (tenant_id)`
 ];

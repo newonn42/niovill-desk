@@ -110,3 +110,36 @@ label.c input { width: 20px; height: 20px; }
 @media (min-width: 760px) { .tbl.rooms .w { display: table-cell; } }
 @media (max-width: 380px) { .tbl.rooms th, .tbl.rooms td { padding: 8px 5px; } .tbl.rooms { font-size: 13px; } }
 .tbl.rooms td.dd { white-space: nowrap; }
+
+/* 현금영수증 체크 */
+.tbl.rooms th.cr, .tbl.rooms td.cr { text-align: center; width: 1%; white-space: nowrap; }
+.crbox { display: inline-flex; padding: 6px; margin: -6px; cursor: pointer; }
+.crbox input, .crline input { width: 20px; height: 20px; accent-color: var(--green, #1E6A4C); }
+.crline { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; font-size: 13px; color: var(--muted); }
+/* 달력 */
+.calhd { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.calhd b { font-size: 18px; flex: 1; text-align: center; }
+.calcard { padding: 8px; }
+.cal { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 2px; }
+.cw { text-align: center; font-size: 12px; color: var(--muted); padding: 4px 0; }
+.cw.sun, .cd.sun .dn { color: #C0392B; } .cw.sat, .cd.sat .dn { color: #2C6FB7; }
+.cd { min-height: 52px; border: 0; background: none; border-radius: 10px; padding: 4px 2px; display: flex; flex-direction: column; align-items: center; gap: 3px; cursor: pointer; font: inherit; color: var(--ink); }
+.cd.empty { cursor: default; }
+.cd .dn { font-size: 14px; font-weight: 700; width: 26px; height: 26px; line-height: 26px; border-radius: 50%; }
+.cd.today .dn { background: var(--ink); color: #fff !important; }
+.cd.on { background: #E8F1EC; }
+.dots { display: flex; flex-wrap: wrap; justify-content: center; gap: 2px; }
+.dot { display: inline-block; min-width: 8px; height: 8px; border-radius: 4px; font-size: 9px; line-height: 8px; color: #fff; font-weight: 800; font-style: normal; }
+.dot:not(:empty) { min-width: 13px; height: 13px; line-height: 13px; border-radius: 7px; padding: 0 2px; }
+.dot.r { background: #D64541; } .dot.n { background: #9AA39D; } .dot.g { background: #2E8B57; } .dot.b { background: #3B7DD8; } .dot.a { background: #E08A1E; } .dot.m { background: #8E6CC0; }
+.legend { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; font-size: 12px; color: var(--muted); padding: 8px 0 2px; }
+.legend span { display: inline-flex; align-items: center; gap: 4px; }
+.calday { display: flex; align-items: center; justify-content: space-between; margin: 14px 2px 8px; }
+.evlist { padding: 4px 12px; }
+.ev { display: flex; align-items: center; gap: 8px; width: 100%; border: 0; background: none; border-bottom: 1px solid var(--line); padding: 12px 0; font: inherit; color: var(--ink); text-align: left; cursor: pointer; }
+.ev:last-child { border-bottom: 0; }
+.ev .et { flex: 1; min-width: 0; font-weight: 700; overflow: hidden; text-overflow: ellipsis; }
+.ev small { color: var(--muted); white-space: nowrap; }
+.ev .go { color: var(--muted); }
+.pill.m { background: #EFE8F8; color: #6A4A9C; }
+.tbl.rooms th.cr small { display: block; font-size: 11px; font-weight: 600; }

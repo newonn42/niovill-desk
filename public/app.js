@@ -141,7 +141,7 @@
   }
 
   /* ── 화면 틀 ── */
-  var NAV = [['#/', '🏠', '홈'], ['#/rooms', '🚪', '호실'], ['#/sms', '✉️', '문자'], ['#/out', '📁', '퇴실'], ['#/settings', '⚙️', '설정']];
+  var NAV = [['#/', '🏠', '홈'], ['#/rooms', '🚪', '호실'], ['#/cal', '📅', '달력'], ['#/sms', '✉️', '문자'], ['#/settings', '⚙️', '설정']];
   function frame(title, opts, content) {
     opts = opts || {};
     app.textContent = '';
@@ -163,6 +163,7 @@
     if (p === '/rooms') return roomsView();
     if ((m = p.match(/^\/t\/(\d+)$/))) return tenantView(+m[1]);
     if (p === '/out') return outView();
+    if (p === '/cal') return calView();
     if (p === '/sms') return smsView();
     if (p === '/settings') return settingsView();
     location.hash = '#/';
@@ -212,11 +213,27 @@
     if (t.status === 'leaving') return h('span', null, p, ' ', h('span', { class: 'pill a', text: '퇴실 ' + sd(t.leave_date) }));
     return p;
   }
+  // 현금영수증: 사람마다 이번 달 체크 하나 (입실 중인 사람만)
+  var ROOM_YM = '';
+  function crBox(t, ym) {
+    if (!t || t.status === 'reserved') return null;
+    var cb = h('input', { type: 'checkbox', checked: t.cr ? true : null, 'aria-label': '이번 달 현금영수증', onclick: function (e) {
+      e.stopPropagation();
+      var box = this, on = box.checked;
+      box.disabled = true;
+      api('cash/toggle', { tenant_id: t.id, ym: ym, done: on }).then(function (z) {
+        box.disabled = false;
+        if (!z.ok) { box.checked = !on; return alert(z.error); }
+        t.cr = on; toast(on ? '현금영수증 체크' : '체크 해제');
+      });
+    } });
+    return h('label', { class: 'crbox', onclick: function (e) { e.stopPropagation(); } }, cb);
+  }
   function roomsView() {
     frame('호실', { wide: roomMode === 'table' }, h('p', { class: 'loading', text: '불러오는 중…' }));
     api('rooms').then(function (r) {
       if (!r.ok) return;
-      TODAY = r.today;
+      TODAY = r.today; ROOM_YM = r.ym;
       var filters = [['all', '전체'], ['late', '미납'], ['vacant', '공실'], ['leaving', '퇴실예정'], ['reserved', '입실예정']];
       var listEl = h('div');
       var lateOf = function (x) { return x.tenant && x.tenant.ledger && x.tenant.ledger.code === 'late'; };
@@ -242,12 +259,12 @@
         return h('th', { class: (cls || '') + ' sortable' + (roomSort === key ? ' on' : ''), onclick: function () { roomSort = key; paint(); }, text: label + (roomSort === key ? ' ▾' : '') });
       }
       function tableOf(list) {
-        var head = h('tr', null, th('호실', 'no'), th('타입', null, 'w'), th('이름'), th('전화', null, 'w'), th('계약', null, 'w'), th('금액', null, 'w num'), th('보증금', null, 'w num'), th('입실일', null, 'w'), th('다음 납부일', 'due'), th('상태', 'late'));
+        var head = h('tr', null, th('호실', 'no'), th('타입', null, 'w'), th('이름'), th('전화', null, 'w'), th('계약', null, 'w'), th('금액', null, 'w num'), th('보증금', null, 'w num'), th('입실일', null, 'w'), th('다음 납부일', 'due'), th('상태', 'late'), h('th', { class: 'cr' }, '현영', h('small', { text: Number(r.ym.slice(5)) + '월' })));
         var rows = [head], lastFloor;
         var grouped = roomSort === 'no';
         list.forEach(function (x) {
           var f = floorOf(x.no);
-          if (grouped && f != null && f !== lastFloor) { rows.push(h('tr', { class: 'floor' }, h('td', { colspan: 10, text: f + '층' }))); lastFloor = f; }
+          if (grouped && f != null && f !== lastFloor) { rows.push(h('tr', { class: 'floor' }, h('td', { colspan: 11, text: f + '층' }))); lastFloor = f; }
           var t = x.tenant;
           var due = !t ? '' : t.status === 'reserved' ? sd(t.move_in) + ' 입실' : (t.ledger ? sd(t.ledger.nextDue) : '');
           var tr = h('tr', { class: 'rrow' + (lateOf(x) ? ' late' : '') + (t ? '' : ' empty'), onclick: function () { if (t) location.hash = '#/t/' + t.id; else if (x.state === 'vacant') registerSheet(x); } },
@@ -260,7 +277,8 @@
             h('td', { class: 'w num', text: t ? man(t.deposit) : '' }),
             h('td', { class: 'w', text: t ? yd(t.move_in) : '' }),
             h('td', { class: 'dd', text: due }),
-            h('td', null, roomStatus(x)));
+            h('td', null, roomStatus(x)),
+            h('td', { class: 'cr' }, crBox(t, r.ym)));
           rows.push(tr);
         });
         return h('div', { class: 'tblwrap' }, h('table', { class: 'tbl rooms' }, rows));
@@ -275,8 +293,8 @@
         listEl.appendChild(cards);
       }
       var chips = h('div', { class: 'chips' }, filters.map(function (f) {
-        return h('button', { type: 'button', class: 'chip' + (roomFilter === f[0] ? ' on' : ''), onclick: function () { roomFilter = f[0]; Array.prototype.forEach.call(chips.children, function (c) { c.classList.remove('on'); }); this.classList.add('on'); paint(); }, text: f[1] });
-      }));
+        return h('button', { type: 'button', class: 'chip' + (roomFilter === f[0] ? ' on' : ''), onclick: function () { roomFilter = f[0]; Array.prototype.forEach.call(chips.querySelectorAll('button'), function (c) { c.classList.remove('on'); }); this.classList.add('on'); paint(); }, text: f[1] });
+      }).concat([h('a', { class: 'chip', href: '#/out', text: '📁 퇴실 기록' })]));
       var search = h('input', { type: 'search', class: 'rsearch', placeholder: '호실·이름 찾기', value: roomQ, oninput: function () { roomQ = this.value; paint(); } });
       var modeBtn = h('button', { type: 'button', class: 'btn sm ghost', text: roomMode === 'table' ? '카드로 보기' : '표로 보기', onclick: function () {
         roomMode = roomMode === 'table' ? 'card' : 'table';
@@ -312,7 +330,8 @@
       return card;
     }
     card.appendChild(h('div', { class: 'line' }, h('span', { text: rentText(t) }), h('span', { text: (l.code === 'late' ? '미납분 ' : '다음 납부 ') + md(l.nextDue) }), ledgerPill(l), t.leave_date ? h('span', { class: 'pill a', text: '퇴실 ' + md(t.leave_date) }) : null));
-    if (l.code !== 'paid') card.appendChild(h('div', { class: 'acts' }, h('button', { class: 'btn sm', type: 'button', onclick: function (e) { e.stopPropagation(); paySheet(t, x.no, l); }, text: '💰 입금 확인' })));
+    card.appendChild(h('div', { class: 'acts' }, l.code !== 'paid' ? h('button', { class: 'btn sm', type: 'button', onclick: function (e) { e.stopPropagation(); paySheet(t, x.no, l); }, text: '💰 입금 확인' }) : null,
+      h('span', { class: 'crline', onclick: function (e) { e.stopPropagation(); } }, '🧾 현영 ' + Number(ROOM_YM.slice(5)) + '월 ', crBox(t, ROOM_YM))));
     return card;
   }
 
@@ -791,6 +810,88 @@
   }
 
   /* ── 퇴실 기록 ── */
+  /* ── 달력 (납부일·입실예정·퇴실·메모) ── */
+  var CAL_YM = '', CAL_DAY = '';
+  var EV_LABEL = { in: '입실예정', leave: '퇴실예정', out: '퇴실', memo: '메모' };
+  var DUE_LABEL = { paid: '완납', late: '미납', today: '오늘 납부일', due: '납부 예정', plan: '납부 예정' };
+  function calView() {
+    if (!CAL_YM) CAL_YM = (TODAY || '').slice(0, 7);
+    frame('달력', {}, h('p', { class: 'loading', text: '불러오는 중…' }));
+    api('calendar?ym=' + CAL_YM).then(function (r) {
+      if (!r.ok) return;
+      TODAY = r.today; CAL_YM = r.ym;
+      if (!CAL_DAY || CAL_DAY.slice(0, 7) !== CAL_YM) CAL_DAY = r.today.slice(0, 7) === CAL_YM ? r.today : CAL_YM + '-01';
+      var by = {};
+      r.events.forEach(function (e) { (by[e.day] = by[e.day] || []).push(e); });
+      var y = +CAL_YM.slice(0, 4), m = +CAL_YM.slice(5, 7);
+      function move(n) { var d = new Date(Date.UTC(y, m - 1 + n, 1)); CAL_YM = d.toISOString().slice(0, 7); CAL_DAY = ''; calView(); }
+      var head = h('div', { class: 'calhd' },
+        h('button', { type: 'button', class: 'btn sm ghost', 'aria-label': '이전 달', onclick: function () { move(-1); }, text: '‹' }),
+        h('b', { text: y + '년 ' + m + '월' }),
+        h('button', { type: 'button', class: 'btn sm ghost', 'aria-label': '다음 달', onclick: function () { move(1); }, text: '›' }),
+        r.today.slice(0, 7) !== CAL_YM ? h('button', { type: 'button', class: 'btn sm ghost', onclick: function () { CAL_YM = r.today.slice(0, 7); CAL_DAY = r.today; calView(); }, text: '오늘' }) : null);
+      var grid = h('div', { class: 'cal' });
+      ['일', '월', '화', '수', '목', '금', '토'].forEach(function (w, i) { grid.appendChild(h('div', { class: 'cw' + (i === 0 ? ' sun' : i === 6 ? ' sat' : ''), text: w })); });
+      var first = new Date(Date.UTC(y, m - 1, 1)).getUTCDay(), last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+      for (var i = 0; i < first; i++) grid.appendChild(h('div', { class: 'cd empty' }));
+      var listEl = h('div');
+      for (var dnum = 1; dnum <= last; dnum++) (function (dnum) {
+        var day = CAL_YM + '-' + (dnum < 10 ? '0' : '') + dnum;
+        var evs = by[day] || [];
+        var dots = h('div', { class: 'dots' });
+        var cnt = {};
+        evs.forEach(function (e) { var k = e.kind === 'due' ? (e.st === 'paid' ? 'g' : e.st === 'late' ? 'r' : 'n') : e.kind === 'in' ? 'b' : e.kind === 'memo' ? 'm' : 'a'; cnt[k] = (cnt[k] || 0) + 1; });
+        ['r', 'n', 'g', 'b', 'a', 'm'].forEach(function (k) { if (cnt[k]) dots.appendChild(h('span', { class: 'dot ' + k, text: cnt[k] > 1 ? String(cnt[k]) : '' })); });
+        var dow = (first + dnum - 1) % 7;
+        var cell = h('button', { type: 'button', class: 'cd' + (day === r.today ? ' today' : '') + (day === CAL_DAY ? ' on' : '') + (dow === 0 ? ' sun' : dow === 6 ? ' sat' : ''), onclick: function () {
+          CAL_DAY = day;
+          Array.prototype.forEach.call(grid.querySelectorAll('.cd.on'), function (c) { c.classList.remove('on'); });
+          cell.classList.add('on'); paintDay();
+        } }, h('span', { class: 'dn', text: String(dnum) }), dots);
+        grid.appendChild(cell);
+      })(dnum);
+      function paintDay() {
+        listEl.textContent = '';
+        var evs = by[CAL_DAY] || [];
+        var d = new Date(CAL_DAY + 'T00:00:00Z');
+        listEl.appendChild(h('div', { class: 'calday' }, h('b', { text: (+CAL_DAY.slice(5, 7)) + '월 ' + (+CAL_DAY.slice(8)) + '일 (' + '일월화수목금토'[d.getUTCDay()] + ')' }),
+          h('button', { type: 'button', class: 'btn sm ghost', onclick: function () { memoSheet({ day: CAL_DAY }); }, text: '+ 메모' })));
+        if (!evs.length) { listEl.appendChild(h('p', { class: 'empty', text: '일정 없음' })); return; }
+        var box = h('div', { class: 'card evlist' });
+        evs.forEach(function (e) {
+          var row;
+          if (e.kind === 'memo') {
+            row = h('button', { type: 'button', class: 'ev', onclick: function () { memoSheet(e); } }, h('span', { class: 'pill m', text: '메모' }), h('span', { class: 'et', text: e.text }), h('small', { text: e.by || '' }));
+          } else {
+            var pill = e.kind === 'due'
+              ? h('span', { class: 'pill ' + (e.st === 'paid' ? 'g' : e.st === 'late' ? 'r' : e.st === 'today' ? 'a' : ''), text: DUE_LABEL[e.st] })
+              : h('span', { class: 'pill ' + (e.kind === 'in' ? 'b' : 'a'), text: EV_LABEL[e.kind] });
+            var amt = e.kind === 'due' ? (e.st === 'paid' ? man(e.amount) : (e.left < e.amount ? '남은 ' + man(e.left) : man(e.amount))) : '';
+            row = h('button', { type: 'button', class: 'ev', onclick: function () { location.hash = '#/t/' + e.tid; } }, pill, h('span', { class: 'et', text: e.room + '호 ' + e.name }), h('small', { text: amt }), h('span', { class: 'go', text: '›' }));
+          }
+          box.appendChild(row);
+        });
+        listEl.appendChild(box);
+      }
+      var legend = h('div', { class: 'legend' }, [['r', '미납'], ['n', '납부 예정'], ['g', '완납'], ['b', '입실예정'], ['a', '퇴실'], ['m', '메모']].map(function (x) { return h('span', null, h('i', { class: 'dot ' + x[0] }), x[1]); }));
+      frame('달력', {}, h('div', { class: 'sec' }, head, h('div', { class: 'card calcard' }, grid, legend), listEl,
+        h('p', { class: 'note', text: '납부일·입실·퇴실은 각 사람 화면에서 고칩니다 (줄을 누르면 이동). 메모는 눌러서 고치거나 지울 수 있습니다.' })));
+      paintDay();
+    });
+  }
+  function memoSheet(e) {
+    var close = sheet(e.id ? '메모 수정' : '메모 추가', h('div', null, submitForm([
+      field('날짜', inp('date', 'day', e.day)),
+      field('내용', inp('text', 'text', e.text || '', { maxlength: 200, placeholder: '예: 605호 방보기 2시 / 복도 청소' }))
+    ], '저장', function (d) {
+      d.id = e.id;
+      return api('memo/save', d).then(function (z) { if (z.ok) { close(); CAL_DAY = d.day; CAL_YM = d.day.slice(0, 7); toast('저장했습니다'); calView(); } return z; });
+    }), e.id ? h('button', { type: 'button', class: 'btn full red', style: 'margin-top:8px', onclick: function () {
+      if (!confirm('이 메모를 지울까요?')) return;
+      api('memo/delete', { id: e.id }).then(function (z) { if (z.ok) { close(); toast('지웠습니다'); calView(); } else alert(z.error); });
+    }, text: '메모 삭제' }) : null));
+  }
+
   function outView() {
     frame('퇴실 기록', {}, h('p', { class: 'loading', text: '불러오는 중…' }));
     api('out').then(function (r) {

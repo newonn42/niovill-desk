@@ -5,7 +5,8 @@ import { chargesOf } from './ledger.js';
 
 // 보관 기간 (개인정보처리방침과 같아야 함)
 export const KEEP = { identityYears: 3, ledgerYears: 5, auditYears: 2, runDetailDays: 365 };
-const TABLES = ['rooms', 'tenants', 'charges', 'payments', 'allocations', 'rent_changes', 'sms_log', 'runs', 'audit'];
+const TABLES = ['rooms', 'tenants', 'charges', 'payments', 'allocations', 'rent_changes', 'sms_log', 'runs', 'audit', 'cash_receipts', 'memos'];
+const OPTIONAL = new Set(['cash_receipts', 'memos']); // 예전 백업 파일에는 없음
 const SKIP_SETTINGS = new Set(['dev_today', 'ensured', 'balanceCache']);
 
 export async function backupJson(env) {
@@ -24,26 +25,30 @@ async function colsOf(db, t) {
 export async function restoreJson(env, data) {
   const db = env.DB;
   if (!data || data.kind !== 'desk-backup' || !data.tables) throw new Error('이 프로그램의 백업 파일이 아닙니다');
-  for (const t of TABLES) if (!Array.isArray(data.tables[t])) throw new Error('백업 파일에 ' + t + ' 표가 없습니다');
+  for (const t of TABLES) if (!Array.isArray(data.tables[t]) && !OPTIONAL.has(t)) throw new Error('백업 파일에 ' + t + ' 표가 없습니다');
   const stmts = [];
   for (const t of TABLES.slice().reverse()) stmts.push(db.prepare('DELETE FROM ' + t));
   await db.batch(stmts);
   const counts = {};
   for (const t of TABLES) {
     const cols = await colsOf(db, t);
-    const rows = data.tables[t];
-    for (let i = 0; i < rows.length; i += 50) {
-      await db.batch(rows.slice(i, i + 50).map((r) => {
+    const rows = data.tables[t] || [];
+    // 무료 요금제 쿼리 한도(요청당 50번) 때문에 크게 묶어서
+    for (let i = 0; i < rows.length; i += 400) {
+      await db.batch(rows.slice(i, i + 400).map((r) => {
         const cs = cols.filter((c) => r[c] !== undefined);
         return db.prepare('INSERT INTO ' + t + ' (' + cs.join(', ') + ') VALUES (' + cs.map(() => '?').join(', ') + ')').bind(...cs.map((c) => r[c]));
       }));
     }
     counts[t] = rows.length;
   }
+  const setStmts = [];
   for (const [k, v] of Object.entries(data.settings || {})) {
     if (SKIP_SETTINGS.has(k)) continue;
-    await db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").bind(k, typeof v === 'string' ? v : JSON.stringify(v)).run();
+    setStmts.push(db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at").bind(k, typeof v === 'string' ? v : JSON.stringify(v)));
   }
+  if (setStmts.length) await db.batch(setStmts);
+
   await db.prepare("DELETE FROM settings WHERE key = 'ensured'").run();
   return counts;
 }
