@@ -196,6 +196,8 @@ async function calendarGet(env, ymIn) {
   const { results: chs } = await db.prepare('SELECT c.id, c.tenant_id, c.k, c.due, c.amount, c.void, (SELECT COALESCE(SUM(a.amount), 0) FROM allocations a WHERE a.charge_id = c.id) AS paid FROM charges c WHERE c.due BETWEEN ? AND ?').bind(from, to).all();
   const { results: last } = await db.prepare('SELECT tenant_id, MAX(k) AS k FROM charges GROUP BY tenant_id').all();
   const { results: memos } = await db.prepare('SELECT id, day, text, by_name FROM memos WHERE day BETWEEN ? AND ? ORDER BY day, id').bind(from, to).all();
+  const { results: hid } = await db.prepare('SELECT key FROM cal_hidden WHERE day BETWEEN ? AND ?').bind(from, to).all();
+  const hidden = new Set((hid || []).map((x) => x.key));
   const lastK = {};
   for (const x of last || []) lastK[x.tenant_id] = x.k;
   const byT = {};
@@ -226,6 +228,8 @@ async function calendarGet(env, ymIn) {
     if (t.status === 'out' && t.out_date) ev.push({ day: t.out_date, kind: 'out', tid: t.id, room: t.room, name: nm(t) });
   }
   for (const x of memos || []) ev.push({ day: x.day, kind: 'memo', id: x.id, text: x.text, by: x.by_name });
+  // 숨김 표시 (key: 종류:대상:날짜, 메모는 memo:번호)
+  for (const e of ev) { e.key = e.kind === 'memo' ? 'memo:' + e.id : e.kind + ':' + e.tid + ':' + e.day; if (hidden.has(e.key)) e.hidden = true; }
   const order = { memo: 0, in: 1, leave: 2, out: 3, due: 4 };
   ev.sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : order[a.kind] - order[b.kind] || String(a.room || '').localeCompare(String(b.room || ''), 'ko', { numeric: true })));
   return json({ ok: true, today, ym, events: ev });
@@ -241,11 +245,22 @@ async function memoSave(env, admin, b) {
   await audit(db, admin, b.id ? '달력 메모 수정' : '달력 메모 추가', day + ' ' + text);
   return json({ ok: true });
 }
+async function calHide(env, admin, b) {
+  const db = env.DB;
+  const key = String(b.key || '');
+  const m = key.match(/^(?:(due|in|leave|out):\d+:(\d{4}-\d{2}-\d{2})|memo:\d+)$/);
+  if (!m) bad('잘못된 요청입니다');
+  const day = m[2] || dateOf(b.day, '날짜');
+  if (b.hide) await db.prepare('INSERT OR IGNORE INTO cal_hidden (key, day, by_name) VALUES (?, ?, ?)').bind(key, day, admin.name).run();
+  else await db.prepare('DELETE FROM cal_hidden WHERE key = ?').bind(key).run();
+  await audit(db, admin, b.hide ? '달력 일정 숨김' : '달력 일정 다시 보이기', day + ' ' + String(b.label || key).slice(0, 60));
+  return json({ ok: true });
+}
 async function memoDelete(env, admin, b) {
   const db = env.DB;
   const m = await db.prepare('SELECT * FROM memos WHERE id = ?').bind(Number(b.id)).first();
   if (!m) bad('메모를 찾을 수 없습니다');
-  await db.prepare('DELETE FROM memos WHERE id = ?').bind(m.id).run();
+  await db.batch([db.prepare('DELETE FROM memos WHERE id = ?').bind(m.id), db.prepare('DELETE FROM cal_hidden WHERE key = ?').bind('memo:' + m.id)]);
   await audit(db, admin, '달력 메모 삭제', m.day + ' ' + m.text);
   return json({ ok: true });
 }
@@ -940,6 +955,7 @@ export async function handleApi(request, env, path) {
       if (path === 'cash/toggle') return await cashToggle(env, admin, b);
       if (path === 'memo/save') return await memoSave(env, admin, b);
       if (path === 'memo/delete') return await memoDelete(env, admin, b);
+      if (path === 'cal/hide') return await calHide(env, admin, b);
       if (path === 'pay/cancel') return await payCancel(env, admin, b);
       if (path === 'invite') return await inviteCreate(env, admin, b);
       if (path === 'admin/active') return await adminActive(env, admin, b);

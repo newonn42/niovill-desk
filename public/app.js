@@ -821,8 +821,9 @@
       if (!r.ok) return;
       TODAY = r.today; CAL_YM = r.ym;
       if (!CAL_DAY || CAL_DAY.slice(0, 7) !== CAL_YM) CAL_DAY = r.today.slice(0, 7) === CAL_YM ? r.today : CAL_YM + '-01';
-      var by = {};
-      r.events.forEach(function (e) { (by[e.day] = by[e.day] || []).push(e); });
+      var by = {}, hidBy = {};
+      r.events.forEach(function (e) { if (e.hidden) (hidBy[e.day] = hidBy[e.day] || []).push(e); else (by[e.day] = by[e.day] || []).push(e); });
+      var showHidden = false;
       var y = +CAL_YM.slice(0, 4), m = +CAL_YM.slice(5, 7);
       function move(n) { var d = new Date(Date.UTC(y, m - 1 + n, 1)); CAL_YM = d.toISOString().slice(0, 7); CAL_DAY = ''; calView(); }
       var head = h('div', { class: 'calhd' },
@@ -856,9 +857,10 @@
         var d = new Date(CAL_DAY + 'T00:00:00Z');
         listEl.appendChild(h('div', { class: 'calday' }, h('b', { text: (+CAL_DAY.slice(5, 7)) + '월 ' + (+CAL_DAY.slice(8)) + '일 (' + '일월화수목금토'[d.getUTCDay()] + ')' }),
           h('button', { type: 'button', class: 'btn sm ghost', onclick: function () { memoSheet({ day: CAL_DAY }); }, text: '+ 메모' })));
-        if (!evs.length) { listEl.appendChild(h('p', { class: 'empty', text: '일정 없음' })); return; }
+        var hid = hidBy[CAL_DAY] || [];
+        if (!evs.length && !(showHidden && hid.length)) listEl.appendChild(h('p', { class: 'empty', text: '일정 없음' }));
         var box = h('div', { class: 'card evlist' });
-        evs.forEach(function (e) {
+        (showHidden ? evs.concat(hid) : evs).forEach(function (e) {
           var row;
           if (e.kind === 'memo') {
             row = h('button', { type: 'button', class: 'ev', onclick: function () { memoSheet(e); } }, h('span', { class: 'pill m', text: '메모' }), h('span', { class: 'et', text: e.text }), h('small', { text: e.by || '' }));
@@ -867,15 +869,24 @@
               ? h('span', { class: 'pill ' + (e.st === 'paid' ? 'g' : e.st === 'late' ? 'r' : e.st === 'today' ? 'a' : ''), text: DUE_LABEL[e.st] })
               : h('span', { class: 'pill ' + (e.kind === 'in' ? 'b' : 'a'), text: EV_LABEL[e.kind] });
             var amt = e.kind === 'due' ? (e.st === 'paid' ? man(e.amount) : (e.left < e.amount ? '남은 ' + man(e.left) : man(e.amount))) : '';
-            row = h('button', { type: 'button', class: 'ev', onclick: function () { location.hash = '#/t/' + e.tid; } }, pill, h('span', { class: 'et', text: e.room + '호 ' + e.name }), h('small', { text: amt }), h('span', { class: 'go', text: '›' }));
+            row = h('button', { type: 'button', class: 'ev', onclick: function () { location.hash = '#/t/' + e.tid; } }, pill, h('span', { class: 'et', text: e.room + '호 ' + e.name }), h('small', { text: amt }));
           }
+          // 숨기기 / 다시 보이기 (장부는 그대로, 달력에서만)
+          var label = e.kind === 'memo' ? e.text : e.room + '호 ' + e.name + ' ' + (e.kind === 'due' ? '납부일' : EV_LABEL[e.kind]);
+          row.appendChild(h('span', { class: 'hide', role: 'button', tabindex: 0, 'aria-label': e.hidden ? '다시 보이기' : '숨기기', text: e.hidden ? '다시 보이기' : '숨기기', onclick: function (ev) {
+            ev.stopPropagation();
+            if (!e.hidden && !confirm('달력에서 숨길까요? (장부·입금 기록은 그대로입니다)\n' + label)) return;
+            api('cal/hide', { key: e.key, day: e.day, hide: !e.hidden, label: label }).then(function (z) { if (z.ok) { toast(e.hidden ? '다시 보이게 했습니다' : '숨겼습니다'); calView(); } else alert(z.error); });
+          } }));
+          if (e.hidden) row.classList.add('hid');
           box.appendChild(row);
         });
-        listEl.appendChild(box);
+        if (box.children.length) listEl.appendChild(box);
+        if (hid.length) listEl.appendChild(h('button', { type: 'button', class: 'link hidtoggle', onclick: function () { showHidden = !showHidden; paintDay(); }, text: showHidden ? '숨긴 일정 감추기' : '숨긴 일정 ' + hid.length + '개 보기' }));
       }
       var legend = h('div', { class: 'legend' }, [['r', '미납'], ['n', '납부 예정'], ['g', '완납'], ['b', '입실예정'], ['a', '퇴실'], ['m', '메모']].map(function (x) { return h('span', null, h('i', { class: 'dot ' + x[0] }), x[1]); }));
       frame('달력', {}, h('div', { class: 'sec' }, head, h('div', { class: 'card calcard' }, grid, legend), listEl,
-        h('p', { class: 'note', text: '납부일·입실·퇴실은 각 사람 화면에서 고칩니다 (줄을 누르면 이동). 메모는 눌러서 고치거나 지울 수 있습니다.' })));
+        h('p', { class: 'note', text: '납부일·입실·퇴실은 각 사람 화면에서 고칩니다 (줄을 누르면 이동). 메모는 눌러서 고치거나 지울 수 있습니다. [숨기기]는 달력에서만 감추고 장부는 그대로입니다.' })));
       paintDay();
     });
   }

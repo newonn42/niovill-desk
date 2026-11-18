@@ -43,4 +43,12 @@ m=[e for e in call('calendar?ym=2026-11')['events'] if e['kind']=='memo'][0]
 r=call('memo/save',{'id':m['id'],'day':'2026-11-21','text':'방보기 3시로 변경'}); m2=[e for e in call('calendar?ym=2026-11')['events'] if e['kind']=='memo'][0]; ok('메모 수정 (날짜·내용)', m2['day']=='2026-11-21' and m2['text']=='방보기 3시로 변경', m2)
 r=call('memo/save',{'day':'2026-11-20','text':''}); ok('빈 메모 거부', not r.get('ok'))
 call('memo/delete',{'id':m['id']}); ok('메모 삭제', not any(e['kind']=='memo' for e in call('calendar?ym=2026-11')['events']))
+ev=call('calendar?ym=2026-11')['events']; e=[x for x in ev if x['kind']=='due' and x['tid']==B2][0]
+r=call('cal/hide',{'key':e['key'],'hide':True,'label':'t'}); ok('숨기기', r.get('ok'), r)
+ev=call('calendar?ym=2026-11')['events']; ok('숨김 표시됨 (다른 건 그대로)', [x for x in ev if x.get('key')==e['key']][0].get('hidden') and sum(1 for x in ev if x.get('hidden'))==1)
+t=call('tenant?id=%d'%B2); ok('장부는 그대로 (미납 유지)', t['ledger']['code']=='late', t['ledger'])
+call('cal/hide',{'key':e['key'],'hide':False}); ok('다시 보이기', not any(x.get('hidden') for x in call('calendar?ym=2026-11')['events']))
+ok('이상한 키 거부', not call('cal/hide',{'key':"x'; DROP",'hide':True}).get('ok'))
+call('memo/save',{'day':'2026-11-26','text':'청소'}); m=[x for x in call('calendar?ym=2026-11')['events'] if x['kind']=='memo'][0]
+ok('메모도 숨기기', call('cal/hide',{'key':m['key'],'day':m['day'],'hide':True}).get('ok') and [x for x in call('calendar?ym=2026-11')['events'] if x['kind']=='memo'][0].get('hidden'))
 print('FAIL',fails) if fails else print('ALL PASS')

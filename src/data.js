@@ -5,8 +5,8 @@ import { chargesOf } from './ledger.js';
 
 // 보관 기간 (개인정보처리방침과 같아야 함)
 export const KEEP = { identityYears: 3, ledgerYears: 5, auditYears: 2, runDetailDays: 365 };
-const TABLES = ['rooms', 'tenants', 'charges', 'payments', 'allocations', 'rent_changes', 'sms_log', 'runs', 'audit', 'cash_receipts', 'memos'];
-const OPTIONAL = new Set(['cash_receipts', 'memos']); // 예전 백업 파일에는 없음
+const TABLES = ['rooms', 'tenants', 'charges', 'payments', 'allocations', 'rent_changes', 'sms_log', 'runs', 'audit', 'cash_receipts', 'memos', 'cal_hidden'];
+const OPTIONAL = new Set(['cash_receipts', 'memos', 'cal_hidden']); // 예전 백업 파일에는 없음
 const SKIP_SETTINGS = new Set(['dev_today', 'ensured', 'balanceCache']);
 
 export async function backupJson(env) {

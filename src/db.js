@@ -50,6 +50,8 @@ const SCHEMA = [
   // 달력 메모 (방보기 약속·청소 등 직접 적는 일정)
   `CREATE TABLE IF NOT EXISTS memos (id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL, text TEXT NOT NULL, by_name TEXT, at TEXT NOT NULL DEFAULT (datetime('now')))`,
   `CREATE INDEX IF NOT EXISTS memos_day ON memos (day)`,
+  // 달력에서 숨긴 일정 (장부는 그대로, 화면에서만 감춤). key 예: due:12:2026-11-05, memo:3
+  `CREATE TABLE IF NOT EXISTS cal_hidden (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, day TEXT NOT NULL, by_name TEXT, at TEXT NOT NULL DEFAULT (datetime('now')))`,
   `CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL DEFAULT (datetime('now')), admin_id INTEGER, who TEXT, action TEXT NOT NULL, detail TEXT, tenant_id INTEGER, room_id INTEGER)`,
   `CREATE INDEX IF NOT EXISTS audit_tenant ON audit (tenant_id)`
 ];
